@@ -1,0 +1,482 @@
+openapi: 3.1.0
+info:
+  title: OSS Commands Gateway API
+  version: 0.2.0
+  description: |
+    Contract for the OSS memory-backed gateway.
+    WebSocket endpoints are described with HTTP upgrade semantics and vendor extensions.
+servers:
+  - url: https://{gateway_host}
+    variables:
+      gateway_host:
+        default: gateway.example.com
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          oneOf:
+            - type: string
+            - type: object
+    DeviceIdentity:
+      type: object
+      properties:
+        deviceId:
+          type: string
+        ownerUid:
+          type: string
+        identityKey:
+          type: string
+    IntegrationRoute:
+      type: object
+      properties:
+        route_id:
+          type: string
+        interface_id:
+          type: string
+        interface_type:
+          type: string
+        token_auth_mode:
+          type: string
+          enum: [path]
+        status:
+          type: string
+          enum: [provisioned, active, inactive]
+        deadline_ms:
+          type: integer
+        max_body_bytes:
+          type: integer
+        token_max_age_days:
+          type: integer
+        token_expires_at:
+          type: string
+          format: date-time
+        token_last_used_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: OK
+  /readyz:
+    get:
+      summary: Readiness probe
+      security: []
+      responses:
+        '200':
+          description: Ready
+  /oauth/authorize:
+    get:
+      summary: Start OAuth authorization code flow
+      security: []
+      responses:
+        '200':
+          description: Authorization response (JSON or HTML)
+    post:
+      summary: Complete OAuth authorization code flow
+      security: []
+      responses:
+        '200':
+          description: Authorization code issued
+  /oauth/token:
+    post:
+      summary: Exchange auth code or refresh token
+      security: []
+      responses:
+        '200':
+          description: Access token response
+  /oauth/token/revoke:
+    post:
+      summary: Revoke refresh token
+      security: []
+      responses:
+        '200':
+          description: Revoked
+
+  /gateway/v1/health:
+    get:
+      summary: Gateway subsystem health
+      responses:
+        '200':
+          description: OK
+
+  /gateway/v1/devices/{device_id}/identity-key:
+    put:
+      summary: Register or update device identity key
+      description: Requires `device` scope.
+      parameters:
+        - in: path
+          name: device_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                identityKey:
+                  type: string
+      responses:
+        '200':
+          description: Device identity updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceIdentity'
+        '403':
+          description: Insufficient scope
+    get:
+      summary: Fetch device identity key
+      description: Requires `gateway:session` scope.
+      parameters:
+        - in: path
+          name: device_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Device identity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceIdentity'
+
+  /gateway/v1/shares/invites:
+    post:
+      summary: Create share invite
+      description: Requires `gateway:share` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deviceId, email]
+              properties:
+                deviceId: { type: string }
+                email: { type: string }
+      responses:
+        '201':
+          description: Invite created
+  /gateway/v1/shares/invites/accept:
+    post:
+      summary: Accept share invite
+      description: Requires `gateway:share` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+                deviceId: { type: string }
+      responses:
+        '200':
+          description: Invite accepted
+  /gateway/v1/shares/devices/{device_id}/grants:
+    get:
+      summary: List grants for a device
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: device_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Grants list
+  /gateway/v1/shares/grants/{grant_id}/revoke:
+    post:
+      summary: Revoke share grant
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: grant_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Grant revoked
+  /gateway/v1/shares/grants/{grant_id}/leave:
+    post:
+      summary: Leave share grant
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: grant_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Grant left
+
+  /gateway/v1/sessions/{session_id}/handshake/client-init:
+    post:
+      summary: Initialize a relay session handshake
+      description: Requires `gateway:session` scope.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deviceId]
+              properties:
+                deviceId: { type: string }
+      responses:
+        '201':
+          description: Handshake created
+  /gateway/v1/sessions/{session_id}/handshake/{handshake_id}:
+    get:
+      summary: Retrieve handshake state
+      description: Requires `gateway:session` scope.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: { type: string }
+        - in: path
+          name: handshake_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Handshake state
+  /gateway/v1/sessions/{session_id}/handshake/agent-ack:
+    post:
+      summary: Agent acknowledgment for handshake
+      description: Requires `device` scope.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Acknowledged
+  /gateway/v1/sessions/{session_id}/messages:
+    post:
+      summary: Send session message
+      description: Requires `gateway:session` scope.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: { type: string }
+      responses:
+        '202':
+          description: Accepted
+  /gateway/v1/sessions/{session_id}/events:
+    get:
+      summary: Stream session events (SSE)
+      description: Requires `gateway:session` scope.
+      parameters:
+        - in: path
+          name: session_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: text/event-stream
+
+  /gateway/v1/agent/connect:
+    get:
+      summary: Agent WebSocket connection
+      description: |
+        Requires `device` scope and HTTP Upgrade to WebSocket.
+      responses:
+        '101':
+          description: WebSocket upgrade successful
+      x-commands-websocket:
+        frame_types:
+          - gateway.connected
+          - session.message
+          - session.progress
+          - session.result
+          - session.error
+          - heartbeat
+
+  /gateway/v1/integrations/routes:
+    post:
+      summary: Create integration route
+      description: Requires `gateway:share` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, interface_type, token_auth_mode]
+              properties:
+                device_id: { type: string }
+                interface_type: { type: string }
+                token_auth_mode: { type: string, enum: [path] }
+                route_token: { type: string }
+                deadline_ms: { type: integer }
+                max_body_bytes: { type: integer }
+                token_max_age_days: { type: integer }
+                interface_id: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  route:
+                    $ref: '#/components/schemas/IntegrationRoute'
+                  public_url:
+                    type: string
+                  route_token:
+                    type: string
+    get:
+      summary: List integration routes
+      description: Requires `gateway:share` scope.
+      responses:
+        '200':
+          description: Route list
+
+  /gateway/v1/integrations/routes/{route_id}:
+    put:
+      summary: Update integration route
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: route_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Updated
+    delete:
+      summary: Revoke integration route
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: route_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Revoked
+
+  /gateway/v1/integrations/routes/{route_id}/rotate-token:
+    post:
+      summary: Rotate route token
+      description: Requires `gateway:share` scope.
+      parameters:
+        - in: path
+          name: route_id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Rotated
+
+  /gateway/v1/integrations/tunnel/connect:
+    get:
+      summary: Integration tunnel WebSocket connection
+      description: |
+        Requires `device` scope and HTTP Upgrade to WebSocket.
+      responses:
+        '101':
+          description: WebSocket upgrade successful
+      x-commands-websocket:
+        frame_types:
+          - tunnel.connected
+          - tunnel.activate
+          - tunnel.activate.result
+          - tunnel.deactivate
+          - tunnel.deactivate.result
+          - tunnel.request
+          - tunnel.response
+          - tunnel.route_deactivated
+          - tunnel.error
+
+  /integrations/{route_id}/{route_token}:
+    parameters:
+      - in: path
+        name: route_id
+        required: true
+        schema: { type: string }
+      - in: path
+        name: route_token
+        required: true
+        schema: { type: string }
+    post:
+      security: []
+      summary: Public webhook ingress
+      description: |
+        Public endpoint authenticated by `route_token` in path.
+        Applies ingress rate limiting and forwards over active tunnel.
+      responses:
+        '200':
+          description: Forwarded response
+        '404':
+          description: Not found / token mismatch / expired
+        '413':
+          description: Payload exceeds route max body size
+        '429':
+          description: Ingress rate limit exceeded
+        '503':
+          description: Route inactive or tunnel unavailable
+        '504':
+          description: Tunnel deadline exceeded
+    get:
+      security: []
+      summary: Public webhook ingress (GET)
+      responses:
+        '200':
+          description: Forwarded response
+    put:
+      security: []
+      summary: Public webhook ingress (PUT)
+      responses:
+        '200':
+          description: Forwarded response
+    patch:
+      security: []
+      summary: Public webhook ingress (PATCH)
+      responses:
+        '200':
+          description: Forwarded response
+    delete:
+      security: []
+      summary: Public webhook ingress (DELETE)
+      responses:
+        '200':
+          description: Forwarded response
+    options:
+      security: []
+      summary: Public webhook ingress (OPTIONS)
+      responses:
+        '200':
+          description: Forwarded response
