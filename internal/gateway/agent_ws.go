@@ -68,8 +68,8 @@ func (h *Handler) RequireAgentWebSocketUpgrade(c fiber.Ctx) error {
 	}
 	h.mu.RLock()
 	ownerConnCount := 0
-	for _, conn := range h.agents {
-		if conn.ownerUID == principal.UID {
+	for did, conn := range h.agents {
+		if conn.ownerUID == principal.UID && did != deviceID {
 			ownerConnCount++
 		}
 	}
@@ -141,8 +141,8 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 	var replaced *agentConn
 	h.mu.Lock()
 	ownerConnCount := 0
-	for _, existing := range h.agents {
-		if existing.ownerUID == ownerUID {
+	for did, existing := range h.agents {
+		if existing.ownerUID == ownerUID && did != deviceID {
 			ownerConnCount++
 		}
 	}
@@ -502,7 +502,7 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 	}
 	pending := make([]pendingHandshake, 0)
 
-	sessions, err := h.store.ListSessions(context.Background())
+	sessions, err := h.store.ListSessionsByDevice(context.Background(), deviceID)
 	if err != nil {
 		return
 	}
@@ -510,8 +510,7 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 		if state == nil {
 			continue
 		}
-		match := state.DeviceID == deviceID && (state.Status == "pending_agent_ack" || state.Status == "pending_agent_connection")
-		if match {
+		if state.Status == "pending_agent_ack" || state.Status == "pending_agent_connection" {
 			pending = append(pending, pendingHandshake{sessionID: state.SessionID})
 		}
 	}
@@ -556,6 +555,7 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 	conn := h.agents[deviceID]
 	h.mu.RUnlock()
 	if conn == nil {
+		// Session-event bus is for SSE fanout, not agent relay transport.
 		return fmt.Errorf("agent_not_connected")
 	}
 

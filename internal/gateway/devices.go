@@ -11,6 +11,8 @@ import (
 	"oss-commands-gateway/internal/gatewaycrypto"
 )
 
+const maxDevicesPerOwner = 200
+
 func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	principal := auth.PrincipalFromContext(c)
 	if principal == nil {
@@ -22,7 +24,9 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	}
 
 	var req putDeviceIdentityKeyRequest
-	_ = c.Bind().Body(&req)
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
 	if strings.TrimSpace(req.IdentityKey) != "" {
 		if err := gatewaycrypto.ValidateEd25519PublicKey(strings.TrimSpace(req.IdentityKey)); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid identity key"})
@@ -35,6 +39,16 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	}
 	if exists && rec.OwnerUID != "" && rec.OwnerUID != principal.UID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
+	}
+	// Enforce per-owner device registration limit for new devices
+	if !exists {
+		ownerDeviceCount, countErr := h.store.CountDevicesByOwner(context.Background(), principal.UID)
+		if countErr != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to count devices"})
+		}
+		if ownerDeviceCount >= maxDevicesPerOwner {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too many registered devices"})
+		}
 	}
 	rec.DeviceID = deviceID
 	rec.OwnerUID = principal.UID

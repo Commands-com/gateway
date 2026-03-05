@@ -577,6 +577,8 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 				return nil
 			})
 		}
+		// Rollback the idempotency reservation so the client can retry
+		h.releaseIdempotencyKey(sessionID, principal.UID, idempotencyKey)
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error":           "agent_unavailable",
 			"session_id":      sessionID,

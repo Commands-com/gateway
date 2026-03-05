@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const oauthSweepInterval = 5 * time.Minute
+
 type authorizationCodeRecord struct {
 	ClientID            string
 	RedirectURI         string
@@ -30,12 +32,49 @@ type memoryStore struct {
 	mu           sync.Mutex
 	authCodes    map[string]authorizationCodeRecord
 	refreshToken map[string]refreshTokenRecord
+	done         chan struct{}
 }
 
 func newMemoryStore() *memoryStore {
-	return &memoryStore{
+	s := &memoryStore{
 		authCodes:    make(map[string]authorizationCodeRecord),
 		refreshToken: make(map[string]refreshTokenRecord),
+		done:         make(chan struct{}),
+	}
+	go s.sweepExpired()
+	return s
+}
+
+func (s *memoryStore) sweepExpired() {
+	ticker := time.NewTicker(oauthSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-ticker.C:
+			nowUnix := now.UTC().Unix()
+			s.mu.Lock()
+			for code, rec := range s.authCodes {
+				if rec.ExpiresAt > 0 && nowUnix > rec.ExpiresAt {
+					delete(s.authCodes, code)
+				}
+			}
+			for token, rec := range s.refreshToken {
+				if rec.ExpiresAt > 0 && nowUnix > rec.ExpiresAt {
+					delete(s.refreshToken, token)
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
+func (s *memoryStore) close() {
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
 	}
 }
 

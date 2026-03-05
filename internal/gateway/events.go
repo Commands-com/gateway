@@ -128,14 +128,14 @@ func (h *Handler) unsubscribe(sessionID string, sub *sseSubscriber) {
 // evictSubscribersByUID evicts all SSE subscribers for the given UID on sessions
 // associated with the given device.
 func (h *Handler) evictSubscribersByUID(uid, deviceID string) {
-	sessions, err := h.store.ListSessions(context.Background())
+	sessions, err := h.store.ListSessionsByDevice(context.Background(), deviceID)
 	if err != nil {
 		return
 	}
 
 	deviceSessions := make(map[string]struct{})
 	for _, state := range sessions {
-		if state == nil || state.DeviceID != deviceID {
+		if state == nil {
 			continue
 		}
 		deviceSessions[state.SessionID] = struct{}{}

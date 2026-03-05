@@ -41,6 +41,16 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
+	// Enforce PKCE: code_challenge is mandatory for all clients.
+	codeChallenge := strings.TrimSpace(req.CodeChallenge)
+	if codeChallenge == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": "code_challenge is required (PKCE)"})
+	}
+	challengeMethod, methodErr := normalizeChallengeMethod(req.CodeChallengeMethod)
+	if methodErr != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": methodErr.Error()})
+	}
+
 	code, err := randomToken(32)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate authorization code"})
@@ -54,8 +64,8 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 		Subject:             identity.UID,
 		Email:               identity.Email,
 		DisplayName:         identity.DisplayName,
-		CodeChallenge:       strings.TrimSpace(req.CodeChallenge),
-		CodeChallengeMethod: normalizeChallengeMethod(req.CodeChallengeMethod),
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: challengeMethod,
 	}, h.cfg.AuthCodeTTL)
 
 	if strings.HasPrefix(req.RedirectURI, "urn:") || strings.EqualFold(req.ResponseMode, "json") || wantsJSON(c) {
@@ -64,8 +74,8 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 			"state":            req.State,
 			"redirect_uri":     req.RedirectURI,
 			"expires_in":       int64(h.cfg.AuthCodeTTL.Seconds()),
-			"code_challenge":   req.CodeChallenge,
-			"challenge_method": normalizeChallengeMethod(req.CodeChallengeMethod),
+			"code_challenge":   codeChallenge,
+			"challenge_method": challengeMethod,
 		})
 	}
 
@@ -175,28 +185,31 @@ func normalizeScope(scope string) string {
 	return strings.Join(clean, " ")
 }
 
-func normalizeChallengeMethod(method string) string {
+func normalizeChallengeMethod(method string) (string, error) {
 	switch strings.ToUpper(strings.TrimSpace(method)) {
 	case "S256":
-		return "S256"
+		return "S256", nil
 	case "PLAIN", "":
-		return "plain"
+		return "plain", nil
 	default:
-		return "plain"
+		return "", fmt.Errorf("unsupported code_challenge_method: %s", method)
 	}
 }
 
 func verifyPKCE(challenge, method, verifier string) error {
 	challenge = strings.TrimSpace(challenge)
 	if challenge == "" {
-		return nil
+		return fmt.Errorf("code_challenge is required")
 	}
 	verifier = strings.TrimSpace(verifier)
 	if verifier == "" {
 		return fmt.Errorf("code_verifier is required")
 	}
-	method = normalizeChallengeMethod(method)
-	switch method {
+	normalizedMethod, err := normalizeChallengeMethod(method)
+	if err != nil {
+		return err
+	}
+	switch normalizedMethod {
 	case "plain":
 		if verifier != challenge {
 			return fmt.Errorf("pkce mismatch")

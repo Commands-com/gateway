@@ -64,6 +64,9 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 	if _, ok, err := h.store.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil || !ok {
 		t.Fatalf("expected route lease claim to succeed, err=%v", err)
 	}
+	if err := h.startRouteBusSubscription(tc, routeID); err != nil {
+		t.Fatalf("start route bus subscription failed: %v", err)
+	}
 
 	h.tunnelWriteFn = func(conn *tunnelConn, frame map[string]any) error {
 		requestID := firstStringMap(frame, "request_id")
@@ -202,16 +205,19 @@ func TestIngressRejectsWhenLeaseOwnedByRemoteNode(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("POST", "/integrations/"+routeID+"/"+routeToken, nil)
-	resp, err := app.Test(req)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 5 * time.Second}) // allow time for deadline timeout
 	if err != nil {
 		t.Fatalf("ingress request failed: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != fiber.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when lease is owned by remote node, got %d", resp.StatusCode)
+	// When the lease is owned by a remote node, the request is forwarded via
+	// the MessageBus rather than rejected immediately. With no remote node
+	// subscribed, the request will timeout at the route deadline.
+	if resp.StatusCode != fiber.StatusGatewayTimeout {
+		t.Fatalf("expected 504 (gateway timeout via cross-node routing) when lease is owned by remote node, got %d", resp.StatusCode)
 	}
 	if calls != 0 {
-		t.Fatalf("expected tunnel dispatch not to run when lease owner is remote")
+		t.Fatalf("expected local tunnel dispatch not to run when lease owner is remote")
 	}
 }
 

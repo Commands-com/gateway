@@ -32,12 +32,14 @@ type StateStore interface {
 	GetSession(ctx context.Context, sessionID string) (*sessionState, bool, error)
 	UpdateSession(ctx context.Context, sessionID string, mutateFn SessionMutator) (*sessionState, error)
 	ListSessions(ctx context.Context) ([]*sessionState, error)
+	ListSessionsByDevice(ctx context.Context, deviceID string) ([]*sessionState, error)
 
 	// Share grants and invite token mappings
 	SaveShareGrant(ctx context.Context, grant *shareGrant) error
 	GetShareGrant(ctx context.Context, grantID string) (*shareGrant, bool, error)
 	ListShareGrants(ctx context.Context) ([]*shareGrant, error)
 	ListShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
+	ListAllShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
 	DeleteShareGrantFromDeviceIndex(ctx context.Context, deviceID, grantID string) error
 	SaveInviteGrantMapping(ctx context.Context, tokenHash, grantID string) error
 	GetInviteGrantID(ctx context.Context, tokenHash string) (string, bool, error)
@@ -61,6 +63,9 @@ type StateStore interface {
 	RenewRouteLease(ctx context.Context, routeID, nodeID string, ttl time.Duration) (RouteLease, bool, error)
 	GetRouteLease(ctx context.Context, routeID string) (RouteLease, bool, error)
 	ReleaseRouteLease(ctx context.Context, routeID, nodeID string) error
+
+	// Device counting by owner (for limits).
+	CountDevicesByOwner(ctx context.Context, ownerUID string) (int, error)
 
 	// Metrics / health counters.
 	CountDevices(ctx context.Context) (int, error)
@@ -211,6 +216,19 @@ func (s *InMemoryStateStore) ListSessions(_ context.Context) ([]*sessionState, e
 	return out, nil
 }
 
+func (s *InMemoryStateStore) ListSessionsByDevice(_ context.Context, deviceID string) ([]*sessionState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*sessionState, 0)
+	for _, sess := range s.sessions {
+		if sess == nil || sess.DeviceID != deviceID {
+			continue
+		}
+		out = append(out, cloneSessionState(sess))
+	}
+	return out, nil
+}
+
 func (s *InMemoryStateStore) SaveShareGrant(_ context.Context, grant *shareGrant) error {
 	if grant == nil || grant.GrantID == "" {
 		return nil
@@ -258,6 +276,21 @@ func (s *InMemoryStateStore) ListShareGrantsByDevice(_ context.Context, deviceID
 	out := make([]*shareGrant, 0, len(grants))
 	for _, grant := range grants {
 		if grant == nil {
+			continue
+		}
+		out = append(out, cloneShareGrant(grant))
+	}
+	return out, nil
+}
+
+// ListAllShareGrantsByDevice returns all grants for a device from the main grants map,
+// including revoked/expired ones that have been removed from the device index.
+func (s *InMemoryStateStore) ListAllShareGrantsByDevice(_ context.Context, deviceID string) ([]*shareGrant, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*shareGrant, 0)
+	for _, grant := range s.grants {
+		if grant == nil || grant.DeviceID != deviceID {
 			continue
 		}
 		out = append(out, cloneShareGrant(grant))
@@ -487,6 +520,18 @@ func (s *InMemoryStateStore) ReleaseRouteLease(_ context.Context, routeID, nodeI
 		delete(s.routeLeases, routeID)
 	}
 	return nil
+}
+
+func (s *InMemoryStateStore) CountDevicesByOwner(_ context.Context, ownerUID string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, dev := range s.devices {
+		if dev.OwnerUID == ownerUID {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (s *InMemoryStateStore) CountDevices(_ context.Context) (int, error) {

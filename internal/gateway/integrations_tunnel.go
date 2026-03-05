@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,12 +19,13 @@ import (
 )
 
 const (
-	tunnelPingInterval    = 30 * time.Second
-	tunnelPongTimeout     = 10 * time.Second
-	inflightSweepInterval = 10 * time.Second
-	inflightRequestMaxAge = 2 * time.Minute
-	routeLeaseTTL         = 15 * time.Second
-	routeLeaseRenewEvery  = 5 * time.Second
+	tunnelPingInterval           = 30 * time.Second
+	tunnelPongTimeout            = 10 * time.Second
+	inflightSweepInterval        = 10 * time.Second
+	inflightRequestMaxAge        = 2 * time.Minute
+	routeLeaseTTL                = 15 * time.Second
+	routeLeaseRenewEvery         = 5 * time.Second
+	maxTunnelConnectionsPerOwner = 50
 )
 
 var wsConnIDCounter uint64
@@ -37,6 +39,7 @@ type tunnelConn struct {
 	lastSeenAt      time.Time
 	sendMu          sync.Mutex
 	activatedRoutes map[string]bool
+	routeBusUnsubs  map[string]func()
 }
 
 func (tc *tunnelConn) writeJSON(payload map[string]any) error {
@@ -65,7 +68,10 @@ type inflightRequest struct {
 	routeID    string
 	deviceID   string
 	responseCh chan *tunnelResponse
-	createdAt  time.Time
+	// publishResponseToBus marks requests that originated from MessageBus route
+	// subscriptions and must be answered via PublishTunnelResponse.
+	publishResponseToBus bool
+	createdAt            time.Time
 }
 
 type tunnelResponse struct {
@@ -95,6 +101,20 @@ func (h *Handler) RequireIntegrationTunnelUpgrade(c fiber.Ctx) error {
 	if device.OwnerUID != principal.UID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
+
+	// Enforce per-owner tunnel connection limit (excluding reconnects for the same device)
+	h.mu.RLock()
+	ownerTunnelCount := 0
+	for did, conn := range h.tunnelConns {
+		if conn.ownerUID == principal.UID && did != deviceID {
+			ownerTunnelCount++
+		}
+	}
+	h.mu.RUnlock()
+	if ownerTunnelCount >= maxTunnelConnectionsPerOwner {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too many tunnel connections"})
+	}
+
 	if !c.IsWebSocket() {
 		return fiber.ErrUpgradeRequired
 	}
@@ -136,6 +156,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 		connectedAt:     now,
 		lastSeenAt:      now,
 		activatedRoutes: make(map[string]bool),
+		routeBusUnsubs:  make(map[string]func()),
 	}
 
 	var replaced *tunnelConn
@@ -220,6 +241,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	if wasActive {
 		h.deactivateAllTunnelRoutes(state, "connection_lost")
 	}
+	h.stopAllRouteBusSubscriptions(state)
 	_ = c.Close()
 }
 
@@ -241,6 +263,186 @@ func (h *Handler) handleTunnelFrame(tc *tunnelConn, payload []byte) {
 		return
 	default:
 		_ = tc.writeJSON(map[string]any{"type": "tunnel.error", "error": "unknown_frame_type"})
+	}
+}
+
+func (h *Handler) startRouteBusSubscription(tc *tunnelConn, routeID string) error {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return nil
+	}
+
+	h.mu.RLock()
+	if tc.routeBusUnsubs != nil {
+		if _, exists := tc.routeBusUnsubs[routeID]; exists {
+			h.mu.RUnlock()
+			return nil
+		}
+	}
+	h.mu.RUnlock()
+
+	reqCh := make(chan TunnelRequestMessage, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	unsub, err := h.bus.SubscribeTunnelRequests(ctx, routeID, reqCh)
+	if err != nil {
+		cancel()
+		return err
+	}
+	stop := func() {
+		cancel()
+		unsub()
+	}
+
+	h.mu.Lock()
+	current, ok := h.tunnelConns[tc.deviceID]
+	if !ok || current != tc || !tc.activatedRoutes[routeID] {
+		h.mu.Unlock()
+		stop()
+		return nil
+	}
+	if tc.routeBusUnsubs == nil {
+		tc.routeBusUnsubs = make(map[string]func())
+	}
+	if _, exists := tc.routeBusUnsubs[routeID]; exists {
+		h.mu.Unlock()
+		stop()
+		return nil
+	}
+	tc.routeBusUnsubs[routeID] = stop
+	h.mu.Unlock()
+
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				stop()
+				return
+			case <-ctx.Done():
+				return
+			case req := <-reqCh:
+				if strings.TrimSpace(req.RequestID) == "" || strings.TrimSpace(req.RouteID) != routeID {
+					continue
+				}
+				h.handleBusTunnelRequest(tc, req)
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (h *Handler) stopRouteBusSubscription(tc *tunnelConn, routeID string) {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return
+	}
+
+	var stop func()
+	h.mu.Lock()
+	if tc.routeBusUnsubs != nil {
+		stop = tc.routeBusUnsubs[routeID]
+		delete(tc.routeBusUnsubs, routeID)
+	}
+	h.mu.Unlock()
+
+	if stop != nil {
+		stop()
+	}
+}
+
+func (h *Handler) stopAllRouteBusSubscriptions(tc *tunnelConn) {
+	if tc == nil {
+		return
+	}
+
+	stops := make([]func(), 0)
+	h.mu.Lock()
+	for routeID, stop := range tc.routeBusUnsubs {
+		delete(tc.routeBusUnsubs, routeID)
+		if stop != nil {
+			stops = append(stops, stop)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, stop := range stops {
+		stop()
+	}
+}
+
+func (h *Handler) handleBusTunnelRequest(tc *tunnelConn, req TunnelRequestMessage) {
+	requestID := strings.TrimSpace(req.RequestID)
+	routeID := strings.TrimSpace(req.RouteID)
+	if requestID == "" || routeID == "" {
+		return
+	}
+
+	h.mu.Lock()
+	current, ok := h.tunnelConns[tc.deviceID]
+	if !ok || current != tc || !tc.activatedRoutes[routeID] {
+		h.mu.Unlock()
+		return
+	}
+	if len(h.inflightRequests) >= maxInflightRequests {
+		h.mu.Unlock()
+		_ = h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+			RequestID: requestID,
+			RouteID:   routeID,
+			Status:    fiber.StatusServiceUnavailable,
+		})
+		return
+	}
+	if _, exists := h.inflightRequests[requestID]; exists {
+		h.mu.Unlock()
+		return
+	}
+	h.inflightRequests[requestID] = &inflightRequest{
+		requestID:            requestID,
+		routeID:              routeID,
+		deviceID:             tc.deviceID,
+		publishResponseToBus: true,
+		createdAt:            time.Now().UTC(),
+	}
+	h.mu.Unlock()
+
+	receivedAt := req.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
+	}
+
+	requestFrame := map[string]any{
+		"type":              "tunnel.request",
+		"request_id":        requestID,
+		"route_id":          routeID,
+		"method":            req.Method,
+		"scheme":            req.Scheme,
+		"host":              req.Host,
+		"external_url":      req.ExternalURL,
+		"raw_target":        req.RawTarget,
+		"raw_target_base64": req.RawTargetBase64,
+		"path":              req.Path,
+		"query":             req.Query,
+		"headers":           req.Headers,
+		"body_base64":       req.BodyBase64,
+		"received_at":       receivedAt.Format(time.RFC3339),
+		"deadline_ms":       req.DeadlineMS,
+	}
+
+	writeFn := h.tunnelWriteFn
+	if writeFn == nil {
+		writeFn = func(conn *tunnelConn, payload map[string]any) error {
+			return conn.writeJSON(payload)
+		}
+	}
+	if err := writeFn(tc, requestFrame); err != nil {
+		h.mu.Lock()
+		delete(h.inflightRequests, requestID)
+		h.mu.Unlock()
+		_ = h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+			RequestID: requestID,
+			RouteID:   routeID,
+			Status:    fiber.StatusServiceUnavailable,
+		})
 	}
 }
 
@@ -386,6 +588,32 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 			h.mu.Lock()
 			tc.activatedRoutes[routeID] = true
 			h.mu.Unlock()
+			if err := h.startRouteBusSubscription(tc, routeID); err != nil {
+				if active {
+					_ = h.store.SetActiveRouteDevice(context.Background(), routeID, existingDeviceID)
+					if supersededTunnel != nil {
+						h.mu.Lock()
+						supersededTunnel.activatedRoutes[routeID] = true
+						h.mu.Unlock()
+					}
+				} else {
+					_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				}
+				h.mu.Lock()
+				delete(tc.activatedRoutes, routeID)
+				h.mu.Unlock()
+				h.stopRouteBusSubscription(tc, routeID)
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to subscribe route bus",
+					},
+				}
+				break
+			}
 			route.Status = "active"
 			route.UpdatedAt = now
 			if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
@@ -421,6 +649,7 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 		}
 
 		if supersededTunnel != nil {
+			h.stopRouteBusSubscription(supersededTunnel, routeID)
 			_ = supersededTunnel.writeJSON(map[string]any{
 				"type":     "tunnel.route_deactivated",
 				"route_id": routeID,
@@ -491,6 +720,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 			h.mu.Lock()
 			delete(tc.activatedRoutes, routeID)
 			h.mu.Unlock()
+			h.stopRouteBusSubscription(tc, routeID)
 			if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
 				results = append(results, map[string]any{
 					"route_id": routeID,
@@ -607,7 +837,24 @@ func (h *Handler) handleTunnelResponse(tc *tunnelConn, frame map[string]any) {
 	}
 	h.mu.Unlock()
 
-	if found && inflight != nil {
+	if !found || inflight == nil {
+		return
+	}
+
+	if inflight.publishResponseToBus {
+		if err := h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+			RequestID:  requestID,
+			RouteID:    inflight.routeID,
+			Status:     resp.Status,
+			Headers:    resp.Headers,
+			BodyBase64: resp.BodyBase64,
+		}); err != nil {
+			log.Printf("[tunnel] bus_publish_response_failed request=%s route=%s err=%v", requestID, inflight.routeID, err)
+		}
+		return
+	}
+
+	if inflight.responseCh != nil {
 		select {
 		case inflight.responseCh <- resp:
 		default:
@@ -624,7 +871,17 @@ func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
 		routeIDs = append(routeIDs, routeID)
 	}
 	tc.activatedRoutes = make(map[string]bool)
+	stops := make([]func(), 0, len(tc.routeBusUnsubs))
+	for routeID, stop := range tc.routeBusUnsubs {
+		delete(tc.routeBusUnsubs, routeID)
+		if stop != nil {
+			stops = append(stops, stop)
+		}
+	}
 	h.mu.Unlock()
+	for _, stop := range stops {
+		stop()
+	}
 
 	routesToDeactivate := make([]string, 0, len(routeIDs))
 	for _, routeID := range routeIDs {
@@ -655,6 +912,80 @@ func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
 	}
 }
 
+func coerceHeaderPairs(raw any) [][]string {
+	if raw == nil {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case [][]string:
+		out := make([][]string, 0, len(typed))
+		for _, pair := range typed {
+			if len(pair) != 2 {
+				continue
+			}
+			if strings.TrimSpace(pair[0]) == "" {
+				continue
+			}
+			out = append(out, []string{pair[0], pair[1]})
+		}
+		return out
+	case []any:
+		out := make([][]string, 0, len(typed))
+		for _, item := range typed {
+			switch pair := item.(type) {
+			case []any:
+				if len(pair) != 2 {
+					continue
+				}
+				key, _ := pair[0].(string)
+				value, _ := pair[1].(string)
+				if strings.TrimSpace(key) == "" {
+					continue
+				}
+				out = append(out, []string{key, value})
+			case []string:
+				if len(pair) != 2 {
+					continue
+				}
+				if strings.TrimSpace(pair[0]) == "" {
+					continue
+				}
+				out = append(out, []string{pair[0], pair[1]})
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func intFromAny(raw any, fallback int) int {
+	switch value := raw.(type) {
+	case int:
+		return value
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case float32:
+		return int(value)
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return fallback
+		}
+		parsed, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return fallback
+		}
+		return parsed
+	default:
+		return fallback
+	}
+}
+
 func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any) (*inflightRequest, error) {
 	requestID := firstStringMap(requestFrame, "request_id")
 	if requestID == "" {
@@ -669,7 +1000,7 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 	if !active {
 		return nil, fmt.Errorf("tunnel_not_connected")
 	}
-	lease, claimed, err := h.store.GetRouteLease(context.Background(), routeID)
+	_, claimed, err := h.store.GetRouteLease(context.Background(), routeID)
 	if err != nil {
 		return nil, fmt.Errorf("route_lease_lookup_failed: %w", err)
 	}
@@ -677,48 +1008,73 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
 		return nil, fmt.Errorf("route_not_claimed")
 	}
-	if lease.NodeID != h.nodeID {
-		return nil, fmt.Errorf("route_claimed_by_remote_node")
+
+	deadlineMS := intFromAny(requestFrame["deadline_ms"], 0)
+	waitTimeout := inflightRequestMaxAge
+	if deadlineMS > 0 {
+		waitTimeout = time.Duration(deadlineMS) * time.Millisecond
+	}
+	if waitTimeout <= 0 {
+		waitTimeout = inflightRequestMaxAge
 	}
 
-	h.mu.Lock()
-	_ = h.pruneStaleInflightRequestsLocked(time.Now().UTC())
-	tunnel, ok := h.tunnelConns[deviceID]
-	if !ok || tunnel == nil {
-		h.mu.Unlock()
-		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-		_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
-		return nil, fmt.Errorf("tunnel_not_connected")
-	}
-	if len(h.inflightRequests) >= maxInflightRequests {
-		h.mu.Unlock()
-		return nil, fmt.Errorf("too_many_inflight_requests")
-	}
-
-	inflight := &inflightRequest{
+	waiter := &inflightRequest{
 		requestID:  requestID,
 		routeID:    routeID,
 		deviceID:   deviceID,
 		responseCh: make(chan *tunnelResponse, 1),
 		createdAt:  time.Now().UTC(),
 	}
-	h.inflightRequests[requestID] = inflight
-	h.mu.Unlock()
 
-	writeFn := h.tunnelWriteFn
-	if writeFn == nil {
-		writeFn = func(tc *tunnelConn, payload map[string]any) error {
-			return tc.writeJSON(payload)
+	respCh := make(chan TunnelResponseMessage, 1)
+	subCtx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	unsub, subErr := h.bus.SubscribeTunnelResponses(subCtx, requestID, respCh)
+	if subErr != nil {
+		cancel()
+		return nil, fmt.Errorf("cross_node_subscribe_failed: %w", subErr)
+	}
+	go func() {
+		defer cancel()
+		defer unsub()
+		select {
+		case resp := <-respCh:
+			tr := &tunnelResponse{
+				Status:     resp.Status,
+				Headers:    resp.Headers,
+				BodyBase64: resp.BodyBase64,
+			}
+			select {
+			case waiter.responseCh <- tr:
+			default:
+			}
+		case <-subCtx.Done():
 		}
-	}
-	if err := writeFn(tunnel, requestFrame); err != nil {
-		h.mu.Lock()
-		delete(h.inflightRequests, requestID)
-		h.mu.Unlock()
-		return nil, fmt.Errorf("tunnel_write_failed: %w", err)
+	}()
+
+	busReq := TunnelRequestMessage{
+		RequestID:       requestID,
+		RouteID:         routeID,
+		Method:          asString(requestFrame["method"]),
+		Scheme:          asString(requestFrame["scheme"]),
+		Host:            asString(requestFrame["host"]),
+		ExternalURL:     asString(requestFrame["external_url"]),
+		RawTarget:       asString(requestFrame["raw_target"]),
+		RawTargetBase64: asString(requestFrame["raw_target_base64"]),
+		Path:            asString(requestFrame["path"]),
+		Query:           asString(requestFrame["query"]),
+		Headers:         coerceHeaderPairs(requestFrame["headers"]),
+		BodyBase64:      asString(requestFrame["body_base64"]),
+		DeadlineMS:      deadlineMS,
+		ReceivedAt:      time.Now().UTC(),
 	}
 
-	return inflight, nil
+	if err := h.bus.PublishTunnelRequest(context.Background(), routeID, busReq); err != nil {
+		cancel()
+		unsub()
+		return nil, fmt.Errorf("cross_node_publish_failed: %w", err)
+	}
+
+	return waiter, nil
 }
 
 func (h *Handler) startTunnelLeaseHeartbeat(tc *tunnelConn, stop <-chan struct{}) {
@@ -774,7 +1130,12 @@ func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
 		return
 	}
 	delete(tc.activatedRoutes, routeID)
+	stop := tc.routeBusUnsubs[routeID]
+	delete(tc.routeBusUnsubs, routeID)
 	h.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 
 	activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
 	if err == nil && active && activeDeviceID == tc.deviceID {

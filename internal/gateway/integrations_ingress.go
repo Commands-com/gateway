@@ -44,13 +44,15 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	if routeCopy.Status != "active" {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
-	lease, leaseFound, err := h.store.GetRouteLease(context.Background(), routeID)
+	_, leaseFound, err := h.store.GetRouteLease(context.Background(), routeID)
 	if err != nil {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
-	if !leaseFound || lease.NodeID != h.nodeID {
+	if !leaseFound {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
+	// If the lease is held by a different node, still proceed — sendTunnelRequest
+	// will forward via the MessageBus for cross-node routing.
 
 	bodyBytes := c.Body()
 	if routeCopy.MaxBodyBytes > 0 && len(bodyBytes) > routeCopy.MaxBodyBytes {
@@ -150,9 +152,6 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		}
 		return c.SendStatus(resp.Status)
 	case <-timer.C:
-		h.mu.Lock()
-		delete(h.inflightRequests, requestID)
-		h.mu.Unlock()
 		log.Printf("[ingress] deadline_exceeded route=%s request=%s deadline=%dms", routeID, requestID, routeCopy.DeadlineMs)
 		return c.SendStatus(fiber.StatusGatewayTimeout)
 	}

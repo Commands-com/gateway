@@ -7,15 +7,20 @@ import (
 )
 
 type TunnelRequestMessage struct {
-	RequestID  string
-	RouteID    string
-	Method     string
-	Path       string
-	Query      string
-	Headers    [][]string
-	BodyBase64 string
-	DeadlineMS int
-	ReceivedAt time.Time
+	RequestID       string
+	RouteID         string
+	Method          string
+	Scheme          string
+	Host            string
+	ExternalURL     string
+	RawTarget       string
+	RawTargetBase64 string
+	Path            string
+	Query           string
+	Headers         [][]string
+	BodyBase64      string
+	DeadlineMS      int
+	ReceivedAt      time.Time
 }
 
 type TunnelResponseMessage struct {

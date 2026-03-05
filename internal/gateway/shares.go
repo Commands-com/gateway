@@ -147,6 +147,9 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 	if grant.InviteTokenExpiresAt > 0 && now > grant.InviteTokenExpiresAt {
 		grant.Status = "expired"
 		grant.UpdatedAt = now
+		// Persist the expired status and clean up the invite mapping
+		_ = h.store.SaveShareGrant(context.Background(), grant)
+		_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
 		return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "invite has expired"})
 	}
 	if grant.GranteeEmail != "" && grant.GranteeEmail != canonicalEmail(principal.Email) {
@@ -174,6 +177,8 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
 	}
+	// Remove the invite token mapping now that it has been consumed
+	_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
 
 	return c.JSON(fiber.Map{
 		"grantId":  grant.GrantID,
@@ -204,15 +209,12 @@ func (h *Handler) ListShareGrants(c fiber.Ctx) error {
 	if rec.OwnerUID != principal.UID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
-	allGrants, err := h.store.ListShareGrants(context.Background())
+	deviceGrants, err := h.store.ListAllShareGrantsByDevice(context.Background(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grants"})
 	}
 	grants := make([]fiber.Map, 0)
-	for _, grant := range allGrants {
-		if grant.DeviceID != deviceID {
-			continue
-		}
+	for _, grant := range deviceGrants {
 		grants = append(grants, fiber.Map{
 			"grantId":         grant.GrantID,
 			"granteeEmail":    grant.GranteeEmail,

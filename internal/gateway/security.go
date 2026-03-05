@@ -110,6 +110,13 @@ func (h *Handler) checkAndReserveIdempotencyKey(sessionID, requesterUID, idempot
 	return true
 }
 
+func (h *Handler) releaseIdempotencyKey(sessionID, requesterUID, idempotencyKey string) {
+	h.idempotencyMu.Lock()
+	defer h.idempotencyMu.Unlock()
+	compound := fmt.Sprintf("%s:%s:%s", sessionID, requesterUID, idempotencyKey)
+	delete(h.idempotencyKeys, compound)
+}
+
 func (h *Handler) validateAndAdvanceTransportFrame(deviceID string, connState *agentConn, frame map[string]any) string {
 	if h.transportTokenIssuer == nil {
 		return ""
