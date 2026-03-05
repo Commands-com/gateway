@@ -53,6 +53,23 @@ func effectiveGrantStatus(grant *shareGrant, now int64) string {
 	return status
 }
 
+// hasActiveGrantLocked reports whether uid has an active grant for deviceID.
+// Caller must hold h.mu (read or write lock).
+func (h *Handler) hasActiveGrantLocked(deviceID, uid string, now int64) bool {
+	if deviceID == "" || uid == "" {
+		return false
+	}
+	for _, grant := range h.grantsByDevice[deviceID] {
+		if grant == nil || grant.GranteeUID != uid {
+			continue
+		}
+		if effectiveGrantStatus(grant, now) == "active" {
+			return true
+		}
+	}
+	return false
+}
+
 func randomToken(size int) (string, error) {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {

@@ -155,6 +155,12 @@ func New(cfg *config.Config) (*fiber.App, error) {
 		gatewayHandler.HandlePublicIngress,
 	)
 
+	// Register shutdown hook to stop background sweeper goroutines
+	app.Hooks().OnPostShutdown(func(_ error) error {
+		gatewayHandler.Close()
+		return nil
+	})
+
 	log.Printf("gateway startup auth_mode=%s state_backend=%s public_base_url=%s", cfg.AuthMode, cfg.StateBackend, cfg.PublicBaseURL)
 	if cfg.AuthMode == config.AuthModeDemo {
 		log.Printf("warning: AUTH_MODE=demo is non-production")

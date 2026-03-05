@@ -18,14 +18,16 @@ const (
 type Handler struct {
 	cfg *config.Config
 
-	mu         sync.RWMutex
-	devices    map[string]deviceRecord
-	grants     map[string]*shareGrant
-	inviteToID map[string]string
-	sessions   map[string]*sessionState
-	events     map[string][]sessionEvent
-	subs       map[string]map[chan sessionEvent]struct{}
-	eventSeq   int64
+	// Lock ordering invariant when both are needed: h.mu -> sessionState.mu.
+	mu             sync.RWMutex
+	devices        map[string]deviceRecord
+	grants         map[string]*shareGrant
+	grantsByDevice map[string][]*shareGrant
+	inviteToID     map[string]string
+	sessions       map[string]*sessionState
+	events         map[string][]sessionEvent
+	subs           map[string]map[*sseSubscriber]struct{}
+	eventSeq       int64
 
 	agents map[string]*agentConn
 
@@ -43,6 +45,8 @@ type Handler struct {
 
 	agentWriteFn  func(*agentConn, map[string]any) error
 	tunnelWriteFn func(*tunnelConn, map[string]any) error
+
+	done chan struct{} // closed on Shutdown to stop background goroutines
 }
 
 type deviceRecord struct {
@@ -92,7 +96,6 @@ type sessionState struct {
 	SeqClientToAgent         int
 	SeqAgentToClient         int
 	Status                   string
-	Members                  map[string]struct{}
 	UpdatedAt                int64
 }
 
@@ -131,10 +134,11 @@ func NewHandler(cfg *config.Config) *Handler {
 		cfg:                      cfg,
 		devices:                  make(map[string]deviceRecord),
 		grants:                   make(map[string]*shareGrant),
+		grantsByDevice:           make(map[string][]*shareGrant),
 		inviteToID:               make(map[string]string),
 		sessions:                 make(map[string]*sessionState),
 		events:                   make(map[string][]sessionEvent),
-		subs:                     make(map[string]map[chan sessionEvent]struct{}),
+		subs:                     make(map[string]map[*sseSubscriber]struct{}),
 		agents:                   make(map[string]*agentConn),
 		integrationRoutes:        make(map[string]*integrationRoute),
 		integrationRouteOwnerIDs: make(map[string]map[string]struct{}),
@@ -144,6 +148,7 @@ func NewHandler(cfg *config.Config) *Handler {
 		idempotencyKeys:          make(map[string]time.Time),
 		transportTokenIssuer:     transportTokenIssuer,
 		transportTokenTTL:        transportTokenTTL,
+		done:                     make(chan struct{}),
 	}
 	h.agentWriteFn = func(ac *agentConn, payload map[string]any) error {
 		return ac.writeJSON(payload)
@@ -154,4 +159,14 @@ func NewHandler(cfg *config.Config) *Handler {
 	h.startInflightSweeper()
 	h.startIdempotencySweeper()
 	return h
+}
+
+// Close stops background sweeper goroutines. Safe to call multiple times.
+func (h *Handler) Close() {
+	select {
+	case <-h.done:
+		// already closed
+	default:
+		close(h.done)
+	}
 }

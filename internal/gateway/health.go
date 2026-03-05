@@ -1,8 +1,22 @@
 package gateway
 
-import "github.com/gofiber/fiber/v3"
+import (
+	"github.com/gofiber/fiber/v3"
 
+	"oss-commands-gateway/internal/auth"
+)
+
+// Health returns a minimal status when unauthenticated, or detailed stats when
+// called by an authenticated user.
 func (h *Handler) Health(c fiber.Ctx) error {
+	principal := auth.PrincipalFromContext(c)
+	if principal == nil {
+		// Unauthenticated: return minimal response only
+		return c.JSON(fiber.Map{
+			"status": "ok",
+		})
+	}
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return c.JSON(fiber.Map{

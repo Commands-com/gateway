@@ -75,16 +75,6 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
-	members := map[string]struct{}{
-		device.OwnerUID: {},
-		principal.UID:   {},
-	}
-	for _, grant := range h.grants {
-		if grant.DeviceID == deviceID && effectiveGrantStatus(grant, nowUnix) == "active" && grant.GranteeUID != "" {
-			members[grant.GranteeUID] = struct{}{}
-		}
-	}
-
 	state, found := h.sessions[sessionID]
 	if !found {
 		state = &sessionState{
@@ -96,30 +86,27 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 			ClientEphemeralPublicKey: clientEphemeral,
 			ClientSessionNonce:       clientNonce,
 			Status:                   "pending_agent_ack",
-			Members:                  members,
 			CreatedAt:                nowUnix,
 			UpdatedAt:                nowUnix,
 		}
 		h.sessions[sessionID] = state
 	} else {
+		state.mu.Lock()
 		if state.DeviceID != deviceID || state.HandshakeID != handshakeID || state.ClientEphemeralPublicKey != clientEphemeral || state.ClientSessionNonce != clientNonce {
+			state.mu.Unlock()
 			h.mu.Unlock()
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "handshake_id already exists with different payload"})
 		}
 		if state.ConversationID != "" && state.ConversationID != conversationID {
+			state.mu.Unlock()
 			h.mu.Unlock()
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "handshake_id already exists with different conversation_id"})
 		}
 		if state.ConversationID == "" {
 			state.ConversationID = conversationID
 		}
-		if state.Members == nil {
-			state.Members = map[string]struct{}{}
-		}
-		for uid := range members {
-			state.Members[uid] = struct{}{}
-		}
 		state.UpdatedAt = nowUnix
+		state.mu.Unlock()
 	}
 	h.mu.Unlock()
 
@@ -131,7 +118,9 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	state.mu.RUnlock()
 
 	if status != "agent_acknowledged" {
+		state.mu.RLock()
 		frame := h.buildHandshakeRequestFrame(state)
+		state.mu.RUnlock()
 		if err := h.sendToAgentForSession(sessionID, frame); err != nil {
 			relayStatus = "pending_agent_connection"
 			relayError = err.Error()
@@ -199,17 +188,17 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
 
+	if !h.isSessionMemberDynamic(principal.UID, state) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
+
 	state.mu.RLock()
-	_, isMember := state.Members[principal.UID]
 	matchesHandshake := state.HandshakeID == handshakeID
 	status := state.Status
 	lastUpdatedAt := state.UpdatedAt
 	frame := h.buildHandshakeRequestFrame(state)
 	state.mu.RUnlock()
 
-	if !isMember {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
-	}
 	if !matchesHandshake {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
 	}
@@ -299,57 +288,80 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device identity not found"})
 	}
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.HandshakeID != handshakeID {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
-	}
-	if state.DeviceID != deviceID {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id mismatch for handshake"})
-	}
-	if state.ConversationID == "" {
-		state.ConversationID = "conv_" + sessionID
+	statusCode := fiber.StatusAccepted
+	var errResp fiber.Map
+	var event map[string]any
+	var resp fiber.Map
+
+	func() {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+
+		if state.HandshakeID != handshakeID {
+			statusCode = fiber.StatusNotFound
+			errResp = fiber.Map{"error": "handshake not found"}
+			return
+		}
+		if state.DeviceID != deviceID {
+			statusCode = fiber.StatusBadRequest
+			errResp = fiber.Map{"error": "device_id mismatch for handshake"}
+			return
+		}
+		if state.ConversationID == "" {
+			state.ConversationID = "conv_" + sessionID
+		}
+
+		expectedTranscript := gatewaycrypto.BuildTranscriptHash(sessionID, handshakeID, state.ClientEphemeralPublicKey, state.ClientSessionNonce, agentEphemeral)
+		if !gatewaycrypto.ConstantTimeEqualBase64(expectedTranscript, transcriptHash) {
+			statusCode = fiber.StatusBadRequest
+			errResp = fiber.Map{"error": "transcript hash mismatch"}
+			return
+		}
+		if err := gatewaycrypto.VerifyAgentSignature(device.IdentityKey, transcriptHash, agentSignature); err != nil {
+			statusCode = fiber.StatusUnauthorized
+			errResp = fiber.Map{"error": "signature verification failed"}
+			return
+		}
+
+		state.AgentEphemeralPublicKey = agentEphemeral
+		state.AgentIdentitySignature = agentSignature
+		state.TranscriptHash = transcriptHash
+		state.Status = "agent_acknowledged"
+		state.LastError = ""
+		state.UpdatedAt = time.Now().UTC().Unix()
+
+		event = map[string]any{
+			"type":                       "session.handshake.ack",
+			"status":                     state.Status,
+			"session_id":                 state.SessionID,
+			"handshake_id":               state.HandshakeID,
+			"conversation_id":            state.ConversationID,
+			"device_id":                  state.DeviceID,
+			"agent_ephemeral_public_key": state.AgentEphemeralPublicKey,
+			"agent_identity_signature":   state.AgentIdentitySignature,
+			"transcript_hash":            state.TranscriptHash,
+			"updated_at":                 time.Unix(state.UpdatedAt, 0).UTC().Format(time.RFC3339),
+		}
+		resp = fiber.Map{
+			"status":          state.Status,
+			"session_id":      state.SessionID,
+			"sessionId":       state.SessionID,
+			"handshake_id":    state.HandshakeID,
+			"handshakeId":     state.HandshakeID,
+			"conversation_id": state.ConversationID,
+			"conversationId":  state.ConversationID,
+		}
+	}()
+
+	if errResp != nil {
+		return c.Status(statusCode).JSON(errResp)
 	}
 
-	expectedTranscript := gatewaycrypto.BuildTranscriptHash(sessionID, handshakeID, state.ClientEphemeralPublicKey, state.ClientSessionNonce, agentEphemeral)
-	if !gatewaycrypto.ConstantTimeEqualBase64(expectedTranscript, transcriptHash) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "transcript hash mismatch"})
-	}
-	if err := gatewaycrypto.VerifyAgentSignature(device.IdentityKey, transcriptHash, agentSignature); err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "signature verification failed"})
-	}
-
-	state.AgentEphemeralPublicKey = agentEphemeral
-	state.AgentIdentitySignature = agentSignature
-	state.TranscriptHash = transcriptHash
-	state.Status = "agent_acknowledged"
-	state.LastError = ""
-	state.UpdatedAt = time.Now().UTC().Unix()
-
-	event := map[string]any{
-		"type":                       "session.handshake.ack",
-		"status":                     state.Status,
-		"session_id":                 state.SessionID,
-		"handshake_id":               state.HandshakeID,
-		"conversation_id":            state.ConversationID,
-		"device_id":                  state.DeviceID,
-		"agent_ephemeral_public_key": state.AgentEphemeralPublicKey,
-		"agent_identity_signature":   state.AgentIdentitySignature,
-		"transcript_hash":            state.TranscriptHash,
-		"updated_at":                 time.Unix(state.UpdatedAt, 0).UTC().Format(time.RFC3339),
-	}
+	// appendSessionEvent acquires h.mu, so we must not hold state.mu here
 	raw, _ := json.Marshal(event)
 	h.appendSessionEvent(sessionID, raw)
 
-	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"status":          state.Status,
-		"session_id":      state.SessionID,
-		"sessionId":       state.SessionID,
-		"handshake_id":    state.HandshakeID,
-		"handshakeId":     state.HandshakeID,
-		"conversation_id": state.ConversationID,
-		"conversationId":  state.ConversationID,
-	})
+	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
 
 func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
@@ -382,17 +394,17 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
 
+	if !h.isSessionMemberDynamic(principal.UID, state) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
+
 	state.mu.RLock()
-	_, isMember := state.Members[principal.UID]
 	handshakeStatus := state.Status
 	handshakeID := state.HandshakeID
 	conversationID := state.ConversationID
 	lastSeq := state.SeqClientToAgent
 	state.mu.RUnlock()
 
-	if !isMember {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
-	}
 	if handshakeStatus != "agent_acknowledged" {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error":           "handshake_not_ready",
@@ -547,15 +559,13 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
-	state.mu.RLock()
-	if _, ok := state.Members[principal.UID]; !ok {
-		state.mu.RUnlock()
+	if !h.isSessionMemberDynamic(principal.UID, state) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
-	state.mu.RUnlock()
 
+	// Subscribe before replay to avoid missing events in the gap
+	sub := h.subscribe(sessionID, principal.UID)
 	replay := h.replayEvents(sessionID, lastEventID)
-	sub := h.subscribe(sessionID)
 
 	c.Set(fiber.HeaderContentType, "text/event-stream")
 	c.Set(fiber.HeaderCacheControl, "no-cache")
@@ -567,20 +577,59 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 		if err := writeSSEComment(w, "connected"); err != nil {
 			return
 		}
+		// isEvicted is a helper that checks whether the subscriber has been
+		// evicted without blocking.
+		isEvicted := func() bool {
+			select {
+			case <-sub.evicted:
+				return true
+			default:
+				return false
+			}
+		}
+
+		// Track the last sent event ID for deduplication (subscribe before replay
+		// may cause overlap)
+		lastSentID := lastEventID
 		for _, evt := range replay {
+			if isEvicted() {
+				return
+			}
 			if err := writeSSEEvent(w, evt); err != nil {
 				return
 			}
+			lastSentID = evt.ID
 		}
 		heartbeat := time.NewTicker(15 * time.Second)
 		defer heartbeat.Stop()
 		for {
+			// Prioritize eviction check so revoked clients disconnect
+			// immediately even if sub.ch has buffered events.
+			if isEvicted() {
+				return
+			}
 			select {
-			case evt := <-sub:
+			case <-sub.evicted:
+				// Subscriber evicted (slow client or auth revoked)
+				return
+			case evt := <-sub.ch:
+				// Deduplicate events that were already sent via replay
+				if lastSentID != "" && !eventIDGreaterThan(evt.ID, lastSentID) {
+					continue
+				}
+				if isEvicted() {
+					return
+				}
 				if err := writeSSEEvent(w, evt); err != nil {
 					return
 				}
+				lastSentID = evt.ID
 			case <-heartbeat.C:
+				// Re-check authorization on each heartbeat
+				if !h.isSessionMemberDynamic(principal.UID, state) {
+					_ = writeSSEComment(w, "authorization_revoked")
+					return
+				}
 				if err := writeSSEComment(w, "heartbeat"); err != nil {
 					return
 				}
@@ -609,4 +658,28 @@ func (h *Handler) buildHandshakeRequestFrame(state *sessionState) map[string]any
 
 func newSessionMessageID() string {
 	return "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+}
+
+// isSessionMemberDynamic checks whether the given UID currently has access to the session
+// by evaluating device ownership and current grant state dynamically.
+// Must be called without holding h.mu or state.mu.
+func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
+	if state == nil {
+		return false
+	}
+
+	state.mu.RLock()
+	deviceID := state.DeviceID
+	ownerUID := state.OwnerUID
+	state.mu.RUnlock()
+
+	// Owner always has access
+	if uid == ownerUID {
+		return true
+	}
+
+	now := time.Now().UTC().Unix()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.hasActiveGrantLocked(deviceID, uid, now)
 }

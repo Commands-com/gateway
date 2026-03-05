@@ -55,8 +55,8 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
 
-	for _, grant := range h.grants {
-		if grant.DeviceID != deviceID || grant.GranteeEmail != granteeEmail {
+	for _, grant := range h.grantsByDevice[deviceID] {
+		if grant == nil || grant.GranteeEmail != granteeEmail {
 			continue
 		}
 		status := effectiveGrantStatus(grant, now)
@@ -87,6 +87,7 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		UpdatedAt:            now,
 	}
 	h.grants[grantID] = grant
+	h.addGrantToDeviceIndexLocked(grant)
 	h.inviteToID[tokenHash] = grantID
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
@@ -246,6 +247,12 @@ func (h *Handler) RevokeShareGrant(c fiber.Ctx) error {
 	grant.RevokedAt = now
 	grant.RevokedByUID = principal.UID
 	grant.UpdatedAt = now
+	h.removeGrantFromDeviceIndexLocked(grant.DeviceID, grant.GrantID)
+
+	// Proactively evict any open SSE streams for the revoked grantee
+	if grant.GranteeUID != "" {
+		h.evictSubscribersByUID(grant.GranteeUID, grant.DeviceID)
+	}
 
 	return c.JSON(fiber.Map{"grantId": grantID, "status": "revoked"})
 }
@@ -282,5 +289,41 @@ func (h *Handler) LeaveShareGrant(c fiber.Ctx) error {
 	grant.RevokedAt = now
 	grant.RevokedByUID = principal.UID
 	grant.UpdatedAt = now
+	h.removeGrantFromDeviceIndexLocked(grant.DeviceID, grant.GrantID)
+
+	// Proactively evict any open SSE streams for the leaving grantee
+	if grant.GranteeUID != "" {
+		h.evictSubscribersByUID(grant.GranteeUID, grant.DeviceID)
+	}
+
 	return c.JSON(fiber.Map{"grantId": grantID, "status": "revoked"})
+}
+
+func (h *Handler) addGrantToDeviceIndexLocked(grant *shareGrant) {
+	if grant == nil || grant.DeviceID == "" {
+		return
+	}
+	h.grantsByDevice[grant.DeviceID] = append(h.grantsByDevice[grant.DeviceID], grant)
+}
+
+func (h *Handler) removeGrantFromDeviceIndexLocked(deviceID, grantID string) {
+	if deviceID == "" || grantID == "" {
+		return
+	}
+	grants := h.grantsByDevice[deviceID]
+	if len(grants) == 0 {
+		return
+	}
+	filtered := grants[:0]
+	for _, grant := range grants {
+		if grant == nil || grant.GrantID == grantID {
+			continue
+		}
+		filtered = append(filtered, grant)
+	}
+	if len(filtered) == 0 {
+		delete(h.grantsByDevice, deviceID)
+		return
+	}
+	h.grantsByDevice[deviceID] = filtered
 }

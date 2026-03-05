@@ -177,6 +177,12 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 			"expires_in":      int(h.transportTokenTTL / time.Second),
 			"at":              now.Format(time.RFC3339),
 		}); err != nil {
+			// Clean up agent state on init write failure to avoid memory leak
+			h.mu.Lock()
+			if current, ok := h.agents[deviceID]; ok && current == state {
+				delete(h.agents, deviceID)
+			}
+			h.mu.Unlock()
 			_ = c.Close()
 			return
 		}

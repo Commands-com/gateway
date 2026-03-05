@@ -90,13 +90,5 @@ func (h *Handler) canAccessDeviceLocked(uid, deviceID string) bool {
 		return true
 	}
 	now := time.Now().UTC().Unix()
-	for _, grant := range h.grants {
-		if grant.DeviceID != deviceID {
-			continue
-		}
-		if effectiveGrantStatus(grant, now) == "active" && grant.GranteeUID == uid {
-			return true
-		}
-	}
-	return false
+	return h.hasActiveGrantLocked(deviceID, uid, now)
 }

@@ -337,7 +337,23 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		}
 	}
 
-	if validatedDeviceID != "" {
+	if validatedDeviceID != "" && validatedDeviceID != route.DeviceID {
+		// Device is changing: deactivate the current active binding if any
+		if activeDeviceID, active := h.activeRoutes[routeID]; active {
+			delete(h.activeRoutes, routeID)
+			if tc, ok := h.tunnelConns[activeDeviceID]; ok {
+				delete(tc.activatedRoutes, routeID)
+				if deactivatedTunnel == nil {
+					deactivatedTunnel = tc
+				}
+			}
+		}
+		// Reset status so the new device must explicitly activate
+		if route.Status == "active" {
+			route.Status = "provisioned"
+		}
+		route.DeviceID = validatedDeviceID
+	} else if validatedDeviceID != "" {
 		route.DeviceID = validatedDeviceID
 	}
 	route.UpdatedAt = now

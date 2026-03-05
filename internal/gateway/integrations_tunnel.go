@@ -546,12 +546,18 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 func (h *Handler) startInflightSweeper() {
 	ticker := time.NewTicker(inflightSweepInterval)
 	go func() {
-		for now := range ticker.C {
-			h.mu.Lock()
-			pruned := h.pruneStaleInflightRequestsLocked(now.UTC())
-			h.mu.Unlock()
-			if pruned > 0 {
-				log.Printf("[tunnel] pruned_stale_inflight count=%d", pruned)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-h.done:
+				return
+			case now := <-ticker.C:
+				h.mu.Lock()
+				pruned := h.pruneStaleInflightRequestsLocked(now.UTC())
+				h.mu.Unlock()
+				if pruned > 0 {
+					log.Printf("[tunnel] pruned_stale_inflight count=%d", pruned)
+				}
 			}
 		}
 	}()

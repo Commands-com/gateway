@@ -71,6 +71,80 @@ func TestShareInviteAcceptAndList(t *testing.T) {
 	}
 }
 
+func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	collabIdentityKey, _ := testEd25519Identity("collab1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+
+	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
+		"deviceId": "devowner1",
+		"email":    "collab@example.com",
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	grantID, _ := inviteResp["grantId"].(string)
+	if grantID == "" {
+		t.Fatalf("expected grantId in create invite response")
+	}
+	inviteURL, _ := inviteResp["inviteUrl"].(string)
+	token := inviteURL[strings.LastIndex(inviteURL, "/")+1:]
+	if token == "" {
+		t.Fatalf("expected invite token in inviteUrl")
+	}
+
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
+		"token":    token,
+		"deviceId": "devcollab1",
+	}, "collab1", "collab@example.com", fiber.StatusOK)
+
+	h.mu.RLock()
+	indexed := len(h.grantsByDevice["devowner1"])
+	hasAccessBeforeRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
+	h.mu.RUnlock()
+	if indexed != 1 {
+		t.Fatalf("expected 1 indexed grant for device, got %d", indexed)
+	}
+	if !hasAccessBeforeRevoke {
+		t.Fatalf("expected collaborator to have access before revoke")
+	}
+
+	mustDoJSON(t, app, "POST", "/gateway/v1/shares/grants/"+grantID+"/revoke", nil, "owner1", "owner@example.com", fiber.StatusOK)
+
+	h.mu.RLock()
+	indexed = len(h.grantsByDevice["devowner1"])
+	hasAccessAfterRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
+	h.mu.RUnlock()
+	if indexed != 0 {
+		t.Fatalf("expected 0 indexed grants after revoke, got %d", indexed)
+	}
+	if hasAccessAfterRevoke {
+		t.Fatalf("expected collaborator access to be removed after revoke")
+	}
+
+	listResp := mustDoJSON(t, app, "GET", "/gateway/v1/shares/devices/devowner1/grants", nil, "owner1", "owner@example.com", fiber.StatusOK)
+	grants, ok := listResp["grants"].([]any)
+	if !ok {
+		t.Fatalf("expected grants array in response")
+	}
+	if len(grants) != 1 {
+		t.Fatalf("expected 1 grant in historical listing, got %d", len(grants))
+	}
+	grant, ok := grants[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected grant object")
+	}
+	if grant["status"] != "revoked" {
+		t.Fatalf("expected listed grant status revoked, got %v", grant["status"])
+	}
+}
+
 func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 	h := NewHandler(&config.Config{
 		FrontendURL:   "https://frontend.example",

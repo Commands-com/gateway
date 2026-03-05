@@ -72,10 +72,15 @@ func (h *Handler) startIdempotencySweeper() {
 	go func() {
 		ticker := time.NewTicker(idempotencySweepInterval)
 		defer ticker.Stop()
-		for now := range ticker.C {
-			h.idempotencyMu.Lock()
-			h.pruneIdempotencyKeysLocked(now.UTC())
-			h.idempotencyMu.Unlock()
+		for {
+			select {
+			case <-h.done:
+				return
+			case now := <-ticker.C:
+				h.idempotencyMu.Lock()
+				h.pruneIdempotencyKeysLocked(now.UTC())
+				h.idempotencyMu.Unlock()
+			}
 		}
 	}()
 }
