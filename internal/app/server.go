@@ -21,6 +21,12 @@ import (
 )
 
 func New(cfg *config.Config) (*fiber.App, error) {
+	return NewWithGatewayOptions(cfg, gateway.HandlerOptions{
+		NodeID: cfg.NodeID,
+	})
+}
+
+func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOptions) (*fiber.App, error) {
 	jwtManager, err := jwt.NewManager(cfg.JWTSigningKey, cfg.PublicBaseURL, cfg.Audience)
 	if err != nil {
 		return nil, fmt.Errorf("jwt init: %w", err)
@@ -47,7 +53,10 @@ func New(cfg *config.Config) (*fiber.App, error) {
 	}
 
 	oauthHandler := oauth.NewHandler(cfg, jwtManager, verifier)
-	gatewayHandler := gateway.NewHandler(cfg)
+	if strings.TrimSpace(gatewayOpts.NodeID) == "" {
+		gatewayOpts.NodeID = cfg.NodeID
+	}
+	gatewayHandler := gateway.NewHandlerWithOptions(cfg, gatewayOpts)
 	healthHandler := health.NewHandler(cfg)
 	ingressLimiter := gateway.NewIngressRateLimiter(
 		cfg.IngressGlobalLimitPerWindow,
@@ -161,7 +170,7 @@ func New(cfg *config.Config) (*fiber.App, error) {
 		return nil
 	})
 
-	log.Printf("gateway startup auth_mode=%s state_backend=%s public_base_url=%s", cfg.AuthMode, cfg.StateBackend, cfg.PublicBaseURL)
+	log.Printf("gateway startup auth_mode=%s state_backend=%s public_base_url=%s node_id=%s", cfg.AuthMode, cfg.StateBackend, cfg.PublicBaseURL, cfg.NodeID)
 	if cfg.AuthMode == config.AuthModeDemo {
 		log.Printf("warning: AUTH_MODE=demo is non-production")
 	}

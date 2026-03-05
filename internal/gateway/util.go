@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -54,12 +55,15 @@ func effectiveGrantStatus(grant *shareGrant, now int64) string {
 }
 
 // hasActiveGrantLocked reports whether uid has an active grant for deviceID.
-// Caller must hold h.mu (read or write lock).
 func (h *Handler) hasActiveGrantLocked(deviceID, uid string, now int64) bool {
 	if deviceID == "" || uid == "" {
 		return false
 	}
-	for _, grant := range h.grantsByDevice[deviceID] {
+	grants, err := h.store.ListShareGrantsByDevice(context.Background(), deviceID)
+	if err != nil {
+		return false
+	}
+	for _, grant := range grants {
 		if grant == nil || grant.GranteeUID != uid {
 			continue
 		}

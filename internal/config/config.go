@@ -26,6 +26,7 @@ type Config struct {
 	AllowOrigins      []string
 	RedirectAllowlist []string
 	FrontendURL       string
+	NodeID            string
 
 	JWTSigningKey    string
 	AccessTokenTTL   time.Duration
@@ -71,6 +72,7 @@ func Load() (*Config, error) {
 		AllowOrigins:      csvOrDefault("ALLOW_ORIGINS", []string{"*"}),
 		RedirectAllowlist: csvOrDefault("REDIRECT_ALLOWLIST", defaultRedirects),
 		FrontendURL:       envOrDefault("FRONTEND_URL", "https://example.com"),
+		NodeID:            envOrDefault("NODE_ID", ""),
 
 		JWTSigningKey:   strings.TrimSpace(os.Getenv("JWT_SIGNING_KEY")),
 		AccessTokenTTL:  durationFromSeconds("ACCESS_TOKEN_TTL_SECONDS", 3600),
@@ -120,6 +122,14 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.PublicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
+	if strings.TrimSpace(cfg.NodeID) == "" {
+		host, _ := os.Hostname()
+		host = strings.TrimSpace(host)
+		if host == "" {
+			host = "node"
+		}
+		cfg.NodeID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -133,6 +143,9 @@ func (c *Config) Validate() error {
 	}
 	if len([]byte(c.JWTSigningKey)) < 32 {
 		return fmt.Errorf("JWT_SIGNING_KEY must be at least 32 bytes")
+	}
+	if strings.TrimSpace(c.NodeID) == "" {
+		return fmt.Errorf("NODE_ID must not be empty")
 	}
 
 	if c.StateBackend == "" {

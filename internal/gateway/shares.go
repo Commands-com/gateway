@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -43,11 +44,10 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 
 	now := time.Now().UTC().Unix()
 	inviteExpiresAt := now + inviteTTL
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	rec, found := h.devices[deviceID]
+	rec, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
@@ -55,7 +55,11 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
 
-	for _, grant := range h.grantsByDevice[deviceID] {
+	grantsForDevice, err := h.store.ListShareGrantsByDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grants"})
+	}
+	for _, grant := range grantsForDevice {
 		if grant == nil || grant.GranteeEmail != granteeEmail {
 			continue
 		}
@@ -86,9 +90,12 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
-	h.grants[grantID] = grant
-	h.addGrantToDeviceIndexLocked(grant)
-	h.inviteToID[tokenHash] = grantID
+	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
+	}
+	if err := h.store.SaveInviteGrantMapping(context.Background(), tokenHash, grantID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save invite"})
+	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"grantId":              grantID,
@@ -119,17 +126,19 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 
 	now := time.Now().UTC().Unix()
 	tokenHash := hashToken(token)
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	grantID, ok := h.inviteToID[tokenHash]
+	grantID, ok, err := h.store.GetInviteGrantID(context.Background(), tokenHash)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read invite"})
+	}
 	if !ok {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found or already used"})
 	}
-	grant, found := h.grants[grantID]
+	grant, found, err := h.store.GetShareGrant(context.Background(), grantID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grant"})
+	}
 	if !found {
-		delete(h.inviteToID, tokenHash)
+		_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found"})
 	}
 	if grant.Status != "pending" {
@@ -148,7 +157,11 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
-		if rec, exists := h.devices[deviceID]; !exists || rec.OwnerUID != principal.UID {
+		rec, exists, err := h.store.GetDevice(context.Background(), deviceID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+		}
+		if !exists || rec.OwnerUID != principal.UID {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 		}
 		grant.GranteeDeviceID = deviceID
@@ -158,6 +171,9 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 	grant.GranteeUID = principal.UID
 	grant.AcceptedAt = now
 	grant.UpdatedAt = now
+	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
+	}
 
 	return c.JSON(fiber.Map{
 		"grantId":  grant.GrantID,
@@ -178,19 +194,22 @@ func (h *Handler) ListShareGrants(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC().Unix()
-
-	h.mu.RLock()
-	rec, found := h.devices[deviceID]
+	rec, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if !found {
-		h.mu.RUnlock()
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
 	if rec.OwnerUID != principal.UID {
-		h.mu.RUnlock()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
+	allGrants, err := h.store.ListShareGrants(context.Background())
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grants"})
+	}
 	grants := make([]fiber.Map, 0)
-	for _, grant := range h.grants {
+	for _, grant := range allGrants {
 		if grant.DeviceID != deviceID {
 			continue
 		}
@@ -206,7 +225,6 @@ func (h *Handler) ListShareGrants(c fiber.Ctx) error {
 			"createdAt":       grant.CreatedAt,
 		})
 	}
-	h.mu.RUnlock()
 
 	return c.JSON(fiber.Map{
 		"deviceId": deviceID,
@@ -225,11 +243,10 @@ func (h *Handler) RevokeShareGrant(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC().Unix()
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	grant, found := h.grants[grantID]
+	grant, found, err := h.store.GetShareGrant(context.Background(), grantID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grant"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "grant not found"})
 	}
@@ -247,7 +264,12 @@ func (h *Handler) RevokeShareGrant(c fiber.Ctx) error {
 	grant.RevokedAt = now
 	grant.RevokedByUID = principal.UID
 	grant.UpdatedAt = now
-	h.removeGrantFromDeviceIndexLocked(grant.DeviceID, grant.GrantID)
+	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
+	}
+	if err := h.store.DeleteShareGrantFromDeviceIndex(context.Background(), grant.DeviceID, grant.GrantID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update grant index"})
+	}
 
 	// Proactively evict any open SSE streams for the revoked grantee
 	if grant.GranteeUID != "" {
@@ -268,11 +290,10 @@ func (h *Handler) LeaveShareGrant(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC().Unix()
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	grant, found := h.grants[grantID]
+	grant, found, err := h.store.GetShareGrant(context.Background(), grantID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grant"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "grant not found"})
 	}
@@ -289,7 +310,12 @@ func (h *Handler) LeaveShareGrant(c fiber.Ctx) error {
 	grant.RevokedAt = now
 	grant.RevokedByUID = principal.UID
 	grant.UpdatedAt = now
-	h.removeGrantFromDeviceIndexLocked(grant.DeviceID, grant.GrantID)
+	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
+	}
+	if err := h.store.DeleteShareGrantFromDeviceIndex(context.Background(), grant.DeviceID, grant.GrantID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update grant index"})
+	}
 
 	// Proactively evict any open SSE streams for the leaving grantee
 	if grant.GranteeUID != "" {
@@ -297,33 +323,4 @@ func (h *Handler) LeaveShareGrant(c fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"grantId": grantID, "status": "revoked"})
-}
-
-func (h *Handler) addGrantToDeviceIndexLocked(grant *shareGrant) {
-	if grant == nil || grant.DeviceID == "" {
-		return
-	}
-	h.grantsByDevice[grant.DeviceID] = append(h.grantsByDevice[grant.DeviceID], grant)
-}
-
-func (h *Handler) removeGrantFromDeviceIndexLocked(deviceID, grantID string) {
-	if deviceID == "" || grantID == "" {
-		return
-	}
-	grants := h.grantsByDevice[deviceID]
-	if len(grants) == 0 {
-		return
-	}
-	filtered := grants[:0]
-	for _, grant := range grants {
-		if grant == nil || grant.GrantID == grantID {
-			continue
-		}
-		filtered = append(filtered, grant)
-	}
-	if len(filtered) == 0 {
-		delete(h.grantsByDevice, deviceID)
-		return
-	}
-	h.grantsByDevice[deviceID] = filtered
 }

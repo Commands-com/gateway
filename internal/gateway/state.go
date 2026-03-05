@@ -18,24 +18,17 @@ const (
 type Handler struct {
 	cfg *config.Config
 
-	// Lock ordering invariant when both are needed: h.mu -> sessionState.mu.
-	mu             sync.RWMutex
-	devices        map[string]deviceRecord
-	grants         map[string]*shareGrant
-	grantsByDevice map[string][]*shareGrant
-	inviteToID     map[string]string
-	sessions       map[string]*sessionState
-	events         map[string][]sessionEvent
-	subs           map[string]map[*sseSubscriber]struct{}
-	eventSeq       int64
+	// Protects handler-local volatile state (agents, tunnels, inflight, subs).
+	mu     *sync.RWMutex
+	store  StateStore
+	bus    MessageBus
+	nodeID string
+	subs   map[string]map[*sseSubscriber]struct{}
 
 	agents map[string]*agentConn
 
-	integrationRoutes        map[string]*integrationRoute
-	integrationRouteOwnerIDs map[string]map[string]struct{}
-	tunnelConns              map[string]*tunnelConn
-	activeRoutes             map[string]string
-	inflightRequests         map[string]*inflightRequest
+	tunnelConns      map[string]*tunnelConn
+	inflightRequests map[string]*inflightRequest
 
 	idempotencyMu   sync.Mutex
 	idempotencyKeys map[string]time.Time
@@ -78,12 +71,12 @@ type shareGrant struct {
 }
 
 type sessionState struct {
-	mu             sync.RWMutex
 	SessionID      string
 	HandshakeID    string
 	DeviceID       string
 	OwnerUID       string
 	ConversationID string
+	Version        int64
 
 	CreatedAt int64
 
@@ -120,7 +113,17 @@ type acceptShareInviteRequest struct {
 	DeviceID string `json:"deviceId"`
 }
 
+type HandlerOptions struct {
+	Store  StateStore
+	Bus    MessageBus
+	NodeID string
+}
+
 func NewHandler(cfg *config.Config) *Handler {
+	return NewHandlerWithOptions(cfg, HandlerOptions{})
+}
+
+func NewHandlerWithOptions(cfg *config.Config, opts HandlerOptions) *Handler {
 	transportTokenTTL := cfg.TransportTokenTTL
 	if transportTokenTTL <= 0 {
 		transportTokenTTL = time.Hour
@@ -130,26 +133,35 @@ func NewHandler(cfg *config.Config) *Handler {
 		transportTokenIssuer = NewTransportTokenIssuer(cfg.TransportTokenSecret)
 	}
 
-	h := &Handler{
-		cfg:                      cfg,
-		devices:                  make(map[string]deviceRecord),
-		grants:                   make(map[string]*shareGrant),
-		grantsByDevice:           make(map[string][]*shareGrant),
-		inviteToID:               make(map[string]string),
-		sessions:                 make(map[string]*sessionState),
-		events:                   make(map[string][]sessionEvent),
-		subs:                     make(map[string]map[*sseSubscriber]struct{}),
-		agents:                   make(map[string]*agentConn),
-		integrationRoutes:        make(map[string]*integrationRoute),
-		integrationRouteOwnerIDs: make(map[string]map[string]struct{}),
-		tunnelConns:              make(map[string]*tunnelConn),
-		activeRoutes:             make(map[string]string),
-		inflightRequests:         make(map[string]*inflightRequest),
-		idempotencyKeys:          make(map[string]time.Time),
-		transportTokenIssuer:     transportTokenIssuer,
-		transportTokenTTL:        transportTokenTTL,
-		done:                     make(chan struct{}),
+	store := opts.Store
+	if store == nil {
+		store = NewInMemoryStateStore()
 	}
+	bus := opts.Bus
+	if bus == nil {
+		bus = NewInMemoryMessageBus()
+	}
+	nodeID := strings.TrimSpace(opts.NodeID)
+	if nodeID == "" {
+		nodeID = "node-local"
+	}
+
+	h := &Handler{
+		cfg:                  cfg,
+		mu:                   &sync.RWMutex{},
+		store:                store,
+		bus:                  bus,
+		nodeID:               nodeID,
+		subs:                 make(map[string]map[*sseSubscriber]struct{}),
+		agents:               make(map[string]*agentConn),
+		tunnelConns:          make(map[string]*tunnelConn),
+		inflightRequests:     make(map[string]*inflightRequest),
+		idempotencyKeys:      make(map[string]time.Time),
+		transportTokenIssuer: transportTokenIssuer,
+		transportTokenTTL:    transportTokenTTL,
+		done:                 make(chan struct{}),
+	}
+
 	h.agentWriteFn = func(ac *agentConn, payload map[string]any) error {
 		return ac.writeJSON(payload)
 	}

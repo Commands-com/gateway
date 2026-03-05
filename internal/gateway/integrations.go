@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"regexp"
@@ -138,9 +139,10 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Invalid device_id format", nil))
 	}
 
-	h.mu.RLock()
-	device, found := h.devices[deviceID]
-	h.mu.RUnlock()
+	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load device", nil))
+	}
 	if !found {
 		return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Device not found; register the device before creating a route", nil))
 	}
@@ -223,13 +225,9 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		TokenCurrentHash: hashRouteToken(plainToken),
 	}
 
-	h.mu.Lock()
-	h.integrationRoutes[routeID] = route
-	if _, ok := h.integrationRouteOwnerIDs[principal.UID]; !ok {
-		h.integrationRouteOwnerIDs[principal.UID] = make(map[string]struct{})
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
 	}
-	h.integrationRouteOwnerIDs[principal.UID][routeID] = struct{}{}
-	h.mu.Unlock()
 
 	publicURL := integrationPublicURL(h.cfg.PublicBaseURL, routeID, plainToken)
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
@@ -267,9 +265,10 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Invalid device_id format", nil))
 		}
-		h.mu.RLock()
-		device, found := h.devices[deviceID]
-		h.mu.RUnlock()
+		device, found, err := h.store.GetDevice(context.Background(), deviceID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load device", nil))
+		}
 		if !found {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Device not found; register the device before binding it to a route", nil))
 		}
@@ -281,20 +280,19 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	var deactivatedTunnel *tunnelConn
-	h.mu.Lock()
-	route, found := h.integrationRoutes[routeID]
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
+	}
 	if !found {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
 	}
 	if route.OwnerUID != principal.UID {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 	}
 
 	if req.DeadlineMs != nil {
 		if *req.DeadlineMs < minIntegrationDeadlineMS || *req.DeadlineMs > maxIntegrationDeadlineMS {
-			h.mu.Unlock()
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", fmt.Sprintf("deadline_ms must be between %d and %d", minIntegrationDeadlineMS, maxIntegrationDeadlineMS), nil))
 		}
 		route.DeadlineMs = *req.DeadlineMs
@@ -302,7 +300,6 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 
 	if req.MaxBodyBytes != nil {
 		if *req.MaxBodyBytes < minIntegrationMaxBodyBytes || *req.MaxBodyBytes > maxIntegrationMaxBodyBytes {
-			h.mu.Unlock()
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", fmt.Sprintf("max_body_bytes must be between %d and %d", minIntegrationMaxBodyBytes, maxIntegrationMaxBodyBytes), nil))
 		}
 		route.MaxBodyBytes = *req.MaxBodyBytes
@@ -310,7 +307,6 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 
 	if strings.TrimSpace(req.TokenAuthMode) != "" {
 		if strings.TrimSpace(req.TokenAuthMode) != "path" {
-			h.mu.Unlock()
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "token_auth_mode must be 'path'", nil))
 		}
 		route.TokenAuthMode = "path"
@@ -321,32 +317,36 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		switch status {
 		case "provisioned", "inactive":
 			route.Status = status
-			if activeDeviceID, active := h.activeRoutes[routeID]; active {
-				delete(h.activeRoutes, routeID)
+			if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
+				_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+				_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				h.mu.Lock()
 				if tc, ok := h.tunnelConns[activeDeviceID]; ok {
 					delete(tc.activatedRoutes, routeID)
 					deactivatedTunnel = tc
 				}
+				h.mu.Unlock()
 			}
 		case "active":
-			h.mu.Unlock()
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_route_update", "'active' status is set via tunnel activation, not REST API", nil))
 		default:
-			h.mu.Unlock()
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_route_update", "status must be 'provisioned' or 'inactive'", nil))
 		}
 	}
 
 	if validatedDeviceID != "" && validatedDeviceID != route.DeviceID {
 		// Device is changing: deactivate the current active binding if any
-		if activeDeviceID, active := h.activeRoutes[routeID]; active {
-			delete(h.activeRoutes, routeID)
+		if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
+			_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+			_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+			h.mu.Lock()
 			if tc, ok := h.tunnelConns[activeDeviceID]; ok {
 				delete(tc.activatedRoutes, routeID)
 				if deactivatedTunnel == nil {
 					deactivatedTunnel = tc
 				}
 			}
+			h.mu.Unlock()
 		}
 		// Reset status so the new device must explicitly activate
 		if route.Status == "active" {
@@ -357,8 +357,10 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		route.DeviceID = validatedDeviceID
 	}
 	route.UpdatedAt = now
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+	}
 	updated := *route
-	h.mu.Unlock()
 
 	if deactivatedTunnel != nil {
 		_ = deactivatedTunnel.writeJSON(map[string]any{
@@ -385,32 +387,30 @@ func (h *Handler) DeleteIntegrationRoute(c fiber.Ctx) error {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	var deactivatedTunnel *tunnelConn
-	h.mu.Lock()
-	route, found := h.integrationRoutes[routeID]
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
+	}
 	if !found {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
 	}
 	if route.OwnerUID != principal.UID {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 	}
 
-	if activeDeviceID, active := h.activeRoutes[routeID]; active {
-		delete(h.activeRoutes, routeID)
+	if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
+		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+		_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+		h.mu.Lock()
 		if tc, ok := h.tunnelConns[activeDeviceID]; ok {
 			delete(tc.activatedRoutes, routeID)
 			deactivatedTunnel = tc
 		}
+		h.mu.Unlock()
 	}
-	delete(h.integrationRoutes, routeID)
-	if ownerRoutes, ok := h.integrationRouteOwnerIDs[principal.UID]; ok {
-		delete(ownerRoutes, routeID)
-		if len(ownerRoutes) == 0 {
-			delete(h.integrationRouteOwnerIDs, principal.UID)
-		}
+	if err := h.store.DeleteIntegrationRoute(context.Background(), routeID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to delete route", nil))
 	}
-	h.mu.Unlock()
 
 	if deactivatedTunnel != nil {
 		_ = deactivatedTunnel.writeJSON(map[string]any{
@@ -437,17 +437,17 @@ func (h *Handler) ListIntegrationRoutes(c fiber.Ctx) error {
 	interfaceType := strings.TrimSpace(c.Query("interface_type"))
 	status := strings.TrimSpace(c.Query("status"))
 
-	h.mu.RLock()
-	ownerRoutes := h.integrationRouteOwnerIDs[principal.UID]
+	ownerRoutes, err := h.store.ListIntegrationRoutesByOwner(context.Background(), principal.UID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to list routes", nil))
+	}
 	routes := make([]integrationRoute, 0, len(ownerRoutes))
-	for routeID := range ownerRoutes {
-		route, ok := h.integrationRoutes[routeID]
-		if !ok || route == nil {
+	for _, route := range ownerRoutes {
+		if route == nil {
 			continue
 		}
 		routes = append(routes, *route)
 	}
-	h.mu.RUnlock()
 
 	sort.Slice(routes, func(i, j int) bool {
 		return routes[i].CreatedAt > routes[j].CreatedAt
@@ -498,14 +498,14 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 	newHash := hashRouteToken(newPlainToken)
 
 	now := time.Now().UTC()
-	h.mu.Lock()
-	route, found := h.integrationRoutes[routeID]
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
+	}
 	if !found {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
 	}
 	if route.OwnerUID != principal.UID {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 	}
 
@@ -520,8 +520,10 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 	route.TokenCurrentHash = newHash
 	route.TokenExpiresAt = now.AddDate(0, 0, route.TokenMaxAgeDays).Format(time.RFC3339)
 	route.UpdatedAt = now.Format(time.RFC3339)
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+	}
 	updated := *route
-	h.mu.Unlock()
 
 	resp := fiber.Map{
 		"route_id":         routeID,

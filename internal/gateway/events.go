@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"strconv"
 	"sync"
 )
@@ -25,19 +26,19 @@ func (s *sseSubscriber) evict() {
 }
 
 func (h *Handler) appendSessionEvent(sessionID string, payload []byte) string {
-	h.mu.Lock()
-	h.eventSeq++
-	event := sessionEvent{ID: strconv.FormatInt(h.eventSeq, 10), Data: payload}
-	h.events[sessionID] = append(h.events[sessionID], event)
-	if len(h.events[sessionID]) > maxEventBacklog {
-		h.events[sessionID] = h.events[sessionID][len(h.events[sessionID])-maxEventBacklog:]
+	event, err := h.store.AppendSessionEvent(context.Background(), sessionID, payload, maxEventBacklog)
+	if err != nil {
+		// keep behavior non-fatal for event append failures
+		return ""
 	}
-	// Snapshot subscriber list under lock
+	_ = h.bus.PublishSessionEvent(context.Background(), sessionID, event)
+
+	h.mu.RLock()
 	subscribers := make([]*sseSubscriber, 0, len(h.subs[sessionID]))
 	for sub := range h.subs[sessionID] {
 		subscribers = append(subscribers, sub)
 	}
-	h.mu.Unlock()
+	h.mu.RUnlock()
 
 	for _, sub := range subscribers {
 		select {
@@ -53,9 +54,10 @@ func (h *Handler) appendSessionEvent(sessionID string, payload []byte) string {
 }
 
 func (h *Handler) replayEvents(sessionID, lastEventID string) []sessionEvent {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	events := h.events[sessionID]
+	events, err := h.store.ListSessionEvents(context.Background(), sessionID)
+	if err != nil || len(events) == 0 {
+		return nil
+	}
 	if len(events) == 0 {
 		return nil
 	}
@@ -125,15 +127,25 @@ func (h *Handler) unsubscribe(sessionID string, sub *sseSubscriber) {
 
 // evictSubscribersByUID evicts all SSE subscribers for the given UID on sessions
 // associated with the given device.
-// Must be called while holding h.mu.Lock (write lock).
 func (h *Handler) evictSubscribersByUID(uid, deviceID string) {
-	for sid, subs := range h.subs {
-		state, ok := h.sessions[sid]
-		if !ok || state == nil {
+	sessions, err := h.store.ListSessions(context.Background())
+	if err != nil {
+		return
+	}
+
+	deviceSessions := make(map[string]struct{})
+	for _, state := range sessions {
+		if state == nil || state.DeviceID != deviceID {
 			continue
 		}
-		// state.DeviceID is immutable after session creation.
-		if state.DeviceID != deviceID {
+		deviceSessions[state.SessionID] = struct{}{}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for sid := range deviceSessions {
+		subs, ok := h.subs[sid]
+		if !ok {
 			continue
 		}
 		for sub := range subs {

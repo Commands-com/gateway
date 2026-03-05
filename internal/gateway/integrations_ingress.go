@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -19,13 +20,14 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
-	h.mu.RLock()
-	route, found := h.integrationRoutes[routeID]
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil {
+		return c.SendStatus(fiber.StatusServiceUnavailable)
+	}
 	var routeCopy integrationRoute
 	if found && route != nil {
 		routeCopy = *route
 	}
-	h.mu.RUnlock()
 	if !found {
 		return c.SendStatus(fiber.StatusNotFound)
 	}
@@ -42,18 +44,26 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	if routeCopy.Status != "active" {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
+	lease, leaseFound, err := h.store.GetRouteLease(context.Background(), routeID)
+	if err != nil {
+		return c.SendStatus(fiber.StatusServiceUnavailable)
+	}
+	if !leaseFound || lease.NodeID != h.nodeID {
+		return c.SendStatus(fiber.StatusServiceUnavailable)
+	}
 
 	bodyBytes := c.Body()
 	if routeCopy.MaxBodyBytes > 0 && len(bodyBytes) > routeCopy.MaxBodyBytes {
 		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 	}
 
-	h.mu.Lock()
-	if current, ok := h.integrationRoutes[routeID]; ok {
-		current.TokenLastUsedAt = now.Format(time.RFC3339)
-		current.UpdatedAt = now.Format(time.RFC3339)
+	if route != nil {
+		route.TokenLastUsedAt = now.Format(time.RFC3339)
+		route.UpdatedAt = now.Format(time.RFC3339)
+		if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+			log.Printf("[ingress] route_update_failed route=%s: %v", routeID, err)
+		}
 	}
-	h.mu.Unlock()
 
 	headers := make([][]string, 0)
 	c.Request().Header.VisitAll(func(key, value []byte) {

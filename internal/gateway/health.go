@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+
 	"github.com/gofiber/fiber/v3"
 
 	"oss-commands-gateway/internal/auth"
@@ -17,18 +19,28 @@ func (h *Handler) Health(c fiber.Ctx) error {
 		})
 	}
 
+	devices, _ := h.store.CountDevices(context.Background())
+	grants, _ := h.store.CountShareGrants(context.Background())
+	sessions, _ := h.store.CountSessions(context.Background())
+	routes, _ := h.store.CountIntegrationRoutes(context.Background())
+	eventBacklogs, _ := h.store.CountSessionEventBacklogs(context.Background())
+
 	h.mu.RLock()
-	defer h.mu.RUnlock()
+	agents := len(h.agents)
+	tunnels := len(h.tunnelConns)
+	inflight := len(h.inflightRequests)
+	h.mu.RUnlock()
+
 	return c.JSON(fiber.Map{
 		"status":         "ok",
 		"state_backend":  h.cfg.StateBackend,
-		"devices":        len(h.devices),
-		"grants":         len(h.grants),
-		"sessions":       len(h.sessions),
-		"agents":         len(h.agents),
-		"routes":         len(h.integrationRoutes),
-		"tunnels":        len(h.tunnelConns),
-		"inflight":       len(h.inflightRequests),
-		"event_backlogs": len(h.events),
+		"devices":        devices,
+		"grants":         grants,
+		"sessions":       sessions,
+		"agents":         agents,
+		"routes":         routes,
+		"tunnels":        tunnels,
+		"inflight":       inflight,
+		"event_backlogs": eventBacklogs,
 	})
 }

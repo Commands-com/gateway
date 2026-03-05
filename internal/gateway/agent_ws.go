@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -61,8 +62,11 @@ func (h *Handler) RequireAgentWebSocketUpgrade(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id query param is required"})
 	}
 
+	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal_error"})
+	}
 	h.mu.RLock()
-	device, found := h.devices[deviceID]
 	ownerConnCount := 0
 	for _, conn := range h.agents {
 		if conn.ownerUID == principal.UID {
@@ -266,29 +270,29 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 	}
 
 	if encryptedSessionFrameTypes[frameType] {
-		h.mu.RLock()
-		state, ok := h.sessions[sessionID]
-		h.mu.RUnlock()
-		if !ok {
+		state, found, err := h.store.GetSession(context.Background(), sessionID)
+		if err != nil || !found || state == nil {
 			return
 		}
 
 		nowUnix := time.Now().UTC().Unix()
-		state.mu.Lock()
 		if state.DeviceID != deviceID || state.Status != "agent_acknowledged" {
-			state.mu.Unlock()
 			return
 		}
 		if handshakeID != "" && state.HandshakeID != handshakeID {
-			state.mu.Unlock()
 			return
 		}
 		if state.ConversationID != "" {
 			frame["conversation_id"] = state.ConversationID
 		}
 		if violation := validateEncryptedEnvelope(frame); violation != "" {
-			state.UpdatedAt = nowUnix
-			state.mu.Unlock()
+			_, _ = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+				if sess.DeviceID != deviceID {
+					return nil
+				}
+				sess.UpdatedAt = nowUnix
+				return nil
+			})
 			log.Printf("[gateway] encryption_violation dir=agent_to_client device=%s session=%s frame=%s violation=%s", deviceID, sessionID, frameType, violation)
 			if h.cfg.RequireEncryptedFrames {
 				return
@@ -296,26 +300,36 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 		} else {
 			seq, _ := extractPositiveInt(frame, "seq")
 			if seq <= state.SeqAgentToClient {
-				state.mu.Unlock()
 				log.Printf("[gateway] replay_rejected dir=agent_to_client device=%s session=%s frame=%s seq=%d", deviceID, sessionID, frameType, seq)
 				return
 			}
-			state.SeqAgentToClient = seq
-			state.UpdatedAt = nowUnix
-			state.mu.Unlock()
+			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+				if sess.DeviceID != deviceID {
+					return nil
+				}
+				if handshakeID != "" && sess.HandshakeID != handshakeID {
+					return nil
+				}
+				if seq <= sess.SeqAgentToClient {
+					return fmt.Errorf("replay_detected")
+				}
+				sess.SeqAgentToClient = seq
+				sess.UpdatedAt = nowUnix
+				return nil
+			})
+			if err != nil || updated == nil {
+				log.Printf("[gateway] replay_rejected dir=agent_to_client device=%s session=%s frame=%s seq=%d", deviceID, sessionID, frameType, seq)
+				return
+			}
 		}
 	}
 
 	if strings.TrimSpace(firstStringMap(frame, "conversation_id", "conversationId")) == "" {
-		h.mu.RLock()
-		state, ok := h.sessions[sessionID]
-		h.mu.RUnlock()
-		if ok {
-			state.mu.RLock()
+		state, found, err := h.store.GetSession(context.Background(), sessionID)
+		if err == nil && found && state != nil {
 			if state.ConversationID != "" {
 				frame["conversation_id"] = state.ConversationID
 			}
-			state.mu.RUnlock()
 		}
 	}
 
@@ -327,17 +341,16 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 }
 
 func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID string, frame map[string]any) bool {
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	device, hasDevice := h.devices[deviceID]
-	h.mu.RUnlock()
-	if !found {
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil || !found || state == nil {
+		return false
+	}
+	device, hasDevice, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
 		return false
 	}
 
 	nowUnix := time.Now().UTC().Unix()
-	state.mu.Lock()
-	defer state.mu.Unlock()
 	if state.DeviceID != deviceID {
 		return false
 	}
@@ -353,17 +366,34 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 	frame["session_id"] = state.SessionID
 	frame["device_id"] = state.DeviceID
 
+	newStatus := state.Status
+	newLastError := state.LastError
+	newAgentEphemeral := state.AgentEphemeralPublicKey
+	newAgentSignature := state.AgentIdentitySignature
+	newTranscriptHash := state.TranscriptHash
+
 	if strings.TrimSpace(firstStringMap(frame, "status")) == "error" {
 		lastErr := strings.TrimSpace(firstStringMap(frame, "error", "details", "message"))
 		if lastErr == "" {
 			lastErr = "agent handshake error"
 		}
-		state.Status = "agent_error"
-		state.LastError = lastErr
-		state.UpdatedAt = nowUnix
+		newStatus = "agent_error"
+		newLastError = lastErr
 		frame["status"] = "agent_error"
 		frame["error"] = lastErr
-		return true
+		_, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			if sess.DeviceID != deviceID {
+				return fmt.Errorf("device_mismatch")
+			}
+			if handshakeID != "" && sess.HandshakeID != handshakeID {
+				return fmt.Errorf("handshake_mismatch")
+			}
+			sess.Status = "agent_error"
+			sess.LastError = lastErr
+			sess.UpdatedAt = nowUnix
+			return nil
+		})
+		return err == nil
 	}
 
 	agentEphemeral := strings.TrimSpace(firstStringMap(frame, "agent_ephemeral_public_key", "agentEphemeralPublicKey"))
@@ -398,37 +428,65 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 	}
 
 	if lastErr != "" {
-		state.Status = "agent_error"
-		state.LastError = lastErr
-		state.UpdatedAt = nowUnix
+		newStatus = "agent_error"
+		newLastError = lastErr
 		frame["status"] = "agent_error"
 		frame["error"] = lastErr
-		return true
+		_, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			if sess.DeviceID != deviceID {
+				return fmt.Errorf("device_mismatch")
+			}
+			if handshakeID != "" && sess.HandshakeID != handshakeID {
+				return fmt.Errorf("handshake_mismatch")
+			}
+			sess.Status = "agent_error"
+			sess.LastError = lastErr
+			sess.UpdatedAt = nowUnix
+			return nil
+		})
+		return err == nil
 	}
 
-	state.AgentEphemeralPublicKey = agentEphemeral
-	state.AgentIdentitySignature = agentSignature
-	state.TranscriptHash = transcriptHash
-	state.Status = "agent_acknowledged"
-	state.LastError = ""
-	state.UpdatedAt = nowUnix
+	newStatus = "agent_acknowledged"
+	newLastError = ""
+	newAgentEphemeral = agentEphemeral
+	newAgentSignature = agentSignature
+	newTranscriptHash = transcriptHash
 
-	frame["status"] = "agent_acknowledged"
-	frame["agent_ephemeral_public_key"] = agentEphemeral
-	frame["agent_identity_signature"] = agentSignature
-	frame["transcript_hash"] = transcriptHash
+	updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		if sess.DeviceID != deviceID {
+			return fmt.Errorf("device_mismatch")
+		}
+		if handshakeID != "" && sess.HandshakeID != handshakeID {
+			return fmt.Errorf("handshake_mismatch")
+		}
+		sess.AgentEphemeralPublicKey = agentEphemeral
+		sess.AgentIdentitySignature = agentSignature
+		sess.TranscriptHash = transcriptHash
+		sess.Status = "agent_acknowledged"
+		sess.LastError = ""
+		sess.UpdatedAt = nowUnix
+		return nil
+	})
+	if err != nil || updated == nil {
+		return false
+	}
+
+	frame["status"] = newStatus
+	frame["agent_ephemeral_public_key"] = newAgentEphemeral
+	frame["agent_identity_signature"] = newAgentSignature
+	frame["transcript_hash"] = newTranscriptHash
+	if newLastError != "" {
+		frame["error"] = newLastError
+	}
 	return true
 }
 
 func (h *Handler) hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID string) bool {
-	h.mu.RLock()
-	state, ok := h.sessions[sessionID]
-	h.mu.RUnlock()
-	if !ok {
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil || !found || state == nil {
 		return false
 	}
-	state.mu.RLock()
-	defer state.mu.RUnlock()
 	if state.DeviceID != deviceID {
 		return false
 	}
@@ -444,30 +502,26 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 	}
 	pending := make([]pendingHandshake, 0)
 
-	h.mu.RLock()
-	for sessionID, state := range h.sessions {
+	sessions, err := h.store.ListSessions(context.Background())
+	if err != nil {
+		return
+	}
+	for _, state := range sessions {
 		if state == nil {
 			continue
 		}
-		state.mu.RLock()
 		match := state.DeviceID == deviceID && (state.Status == "pending_agent_ack" || state.Status == "pending_agent_connection")
-		state.mu.RUnlock()
 		if match {
-			pending = append(pending, pendingHandshake{sessionID: sessionID})
+			pending = append(pending, pendingHandshake{sessionID: state.SessionID})
 		}
 	}
-	h.mu.RUnlock()
 
 	for _, p := range pending {
-		h.mu.RLock()
-		state, ok := h.sessions[p.sessionID]
-		h.mu.RUnlock()
-		if !ok || state == nil {
+		state, found, err := h.store.GetSession(context.Background(), p.sessionID)
+		if err != nil || !found || state == nil {
 			continue
 		}
-		state.mu.RLock()
 		frame := h.buildHandshakeRequestFrame(state)
-		state.mu.RUnlock()
 		if frame == nil {
 			continue
 		}
@@ -479,24 +533,24 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 			newError = err.Error()
 		}
 
-		state.mu.Lock()
-		state.Status = newStatus
-		state.LastError = newError
-		state.UpdatedAt = time.Now().UTC().Unix()
-		state.mu.Unlock()
+		_, _ = h.store.UpdateSession(context.Background(), p.sessionID, func(sess *sessionState) error {
+			if sess.DeviceID != deviceID {
+				return nil
+			}
+			sess.Status = newStatus
+			sess.LastError = newError
+			sess.UpdatedAt = time.Now().UTC().Unix()
+			return nil
+		})
 	}
 }
 
 func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any) error {
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	h.mu.RUnlock()
-	if !found {
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil || !found || state == nil {
 		return fmt.Errorf("session_not_found")
 	}
-	state.mu.RLock()
 	deviceID := state.DeviceID
-	state.mu.RUnlock()
 
 	h.mu.RLock()
 	conn := h.agents[deviceID]

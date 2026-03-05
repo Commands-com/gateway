@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -64,18 +66,22 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	now := time.Now().UTC()
 	nowUnix := now.Unix()
 
-	h.mu.Lock()
-	device, exists := h.devices[deviceID]
+	device, exists, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if !exists {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
 	if !h.canAccessDeviceLocked(principal.UID, deviceID) {
-		h.mu.Unlock()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
-	state, found := h.sessions[sessionID]
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+	}
+	sessionPreexisted := found
 	if !found {
 		state = &sessionState{
 			SessionID:                sessionID,
@@ -89,59 +95,86 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 			CreatedAt:                nowUnix,
 			UpdatedAt:                nowUnix,
 		}
-		h.sessions[sessionID] = state
-	} else {
-		state.mu.Lock()
-		if state.DeviceID != deviceID || state.HandshakeID != handshakeID || state.ClientEphemeralPublicKey != clientEphemeral || state.ClientSessionNonce != clientNonce {
-			state.mu.Unlock()
-			h.mu.Unlock()
+		created, err := h.store.CreateSession(context.Background(), state)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+		}
+		if !created {
+			// A concurrent writer created the session between Get and Create.
+			state, found, err = h.store.GetSession(context.Background(), sessionID)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+			}
+			if !found {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+			}
+			sessionPreexisted = true
+		}
+	}
+	if sessionPreexisted {
+		payloadConflictErr := errors.New("payload_conflict")
+		conversationConflictErr := errors.New("conversation_conflict")
+		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			if sess.DeviceID != deviceID || sess.HandshakeID != handshakeID || sess.ClientEphemeralPublicKey != clientEphemeral || sess.ClientSessionNonce != clientNonce {
+				return payloadConflictErr
+			}
+			if sess.ConversationID != "" && sess.ConversationID != conversationID {
+				return conversationConflictErr
+			}
+			if sess.ConversationID == "" {
+				sess.ConversationID = conversationID
+			}
+			sess.UpdatedAt = nowUnix
+			return nil
+		})
+		if errors.Is(err, payloadConflictErr) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "handshake_id already exists with different payload"})
 		}
-		if state.ConversationID != "" && state.ConversationID != conversationID {
-			state.mu.Unlock()
-			h.mu.Unlock()
+		if errors.Is(err, conversationConflictErr) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "handshake_id already exists with different conversation_id"})
 		}
-		if state.ConversationID == "" {
-			state.ConversationID = conversationID
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
 		}
-		state.UpdatedAt = nowUnix
-		state.mu.Unlock()
+		state = updated
 	}
-	h.mu.Unlock()
 
 	relayStatus := "already_acknowledged"
 	relayError := ""
-
-	state.mu.RLock()
 	status := state.Status
-	state.mu.RUnlock()
 
 	if status != "agent_acknowledged" {
-		state.mu.RLock()
 		frame := h.buildHandshakeRequestFrame(state)
-		state.mu.RUnlock()
 		if err := h.sendToAgentForSession(sessionID, frame); err != nil {
 			relayStatus = "pending_agent_connection"
 			relayError = err.Error()
-			state.mu.Lock()
-			state.Status = "pending_agent_connection"
-			state.LastError = relayError
-			state.UpdatedAt = time.Now().UTC().Unix()
-			state.mu.Unlock()
+			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+				sess.Status = "pending_agent_connection"
+				sess.LastError = relayError
+				sess.UpdatedAt = time.Now().UTC().Unix()
+				return nil
+			})
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+			}
+			state = updated
 		} else {
 			relayStatus = "forwarded_to_agent"
-			state.mu.Lock()
-			if state.Status == "pending_agent_connection" {
-				state.Status = "pending_agent_ack"
+			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+				if sess.Status == "pending_agent_connection" {
+					sess.Status = "pending_agent_ack"
+				}
+				sess.LastError = ""
+				sess.UpdatedAt = time.Now().UTC().Unix()
+				return nil
+			})
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
 			}
-			state.LastError = ""
-			state.UpdatedAt = time.Now().UTC().Unix()
-			state.mu.Unlock()
+			state = updated
 		}
 	}
 
-	state.mu.RLock()
 	resp := fiber.Map{
 		"status":                      state.Status,
 		"session_id":                  state.SessionID,
@@ -162,7 +195,6 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	if state.LastError != "" {
 		resp["last_error"] = state.LastError
 	}
-	state.mu.RUnlock()
 
 	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
@@ -181,9 +213,10 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	h.mu.RUnlock()
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
@@ -192,16 +225,12 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
-	state.mu.RLock()
-	matchesHandshake := state.HandshakeID == handshakeID
+	if state.HandshakeID != handshakeID {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
+	}
 	status := state.Status
 	lastUpdatedAt := state.UpdatedAt
 	frame := h.buildHandshakeRequestFrame(state)
-	state.mu.RUnlock()
-
-	if !matchesHandshake {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
-	}
 
 	if (status == "pending_agent_ack" || status == "pending_agent_connection") && time.Since(time.Unix(lastUpdatedAt, 0)) >= handshakeRetryInterval {
 		newStatus := "pending_agent_ack"
@@ -210,14 +239,24 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 			newStatus = "pending_agent_connection"
 			newError = err.Error()
 		}
-		state.mu.Lock()
-		state.Status = newStatus
-		state.LastError = newError
-		state.UpdatedAt = time.Now().UTC().Unix()
-		state.mu.Unlock()
+		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			if sess.HandshakeID != handshakeID {
+				return ErrSessionNotFound
+			}
+			sess.Status = newStatus
+			sess.LastError = newError
+			sess.UpdatedAt = time.Now().UTC().Unix()
+			return nil
+		})
+		if errors.Is(err, ErrSessionNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
+		}
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+		}
+		state = updated
 	}
 
-	state.mu.RLock()
 	resp := fiber.Map{
 		"session_id":                  state.SessionID,
 		"sessionId":                   state.SessionID,
@@ -236,7 +275,6 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		"created_at":                  time.Unix(state.CreatedAt, 0).UTC().Format(time.RFC3339),
 		"updated_at":                  time.Unix(state.UpdatedAt, 0).UTC().Format(time.RFC3339),
 	}
-	state.mu.RUnlock()
 	return c.JSON(resp)
 }
 
@@ -274,10 +312,14 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid ephemeral public key"})
 	}
 
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	device, hasDevice := h.devices[deviceID]
-	h.mu.RUnlock()
+	_, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+	}
+	device, hasDevice, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "handshake not found"})
 	}
@@ -292,72 +334,84 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 	var errResp fiber.Map
 	var event map[string]any
 	var resp fiber.Map
+	handshakeNotFoundErr := errors.New("handshake_not_found")
+	deviceMismatchErr := errors.New("device_mismatch")
+	transcriptMismatchErr := errors.New("transcript_mismatch")
+	signatureErr := errors.New("signature_verification_failed")
 
-	func() {
-		state.mu.Lock()
-		defer state.mu.Unlock()
-
-		if state.HandshakeID != handshakeID {
-			statusCode = fiber.StatusNotFound
-			errResp = fiber.Map{"error": "handshake not found"}
-			return
+	_, err = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		if sess.HandshakeID != handshakeID {
+			return handshakeNotFoundErr
 		}
-		if state.DeviceID != deviceID {
-			statusCode = fiber.StatusBadRequest
-			errResp = fiber.Map{"error": "device_id mismatch for handshake"}
-			return
+		if sess.DeviceID != deviceID {
+			return deviceMismatchErr
 		}
-		if state.ConversationID == "" {
-			state.ConversationID = "conv_" + sessionID
+		if sess.ConversationID == "" {
+			sess.ConversationID = "conv_" + sessionID
 		}
 
-		expectedTranscript := gatewaycrypto.BuildTranscriptHash(sessionID, handshakeID, state.ClientEphemeralPublicKey, state.ClientSessionNonce, agentEphemeral)
+		expectedTranscript := gatewaycrypto.BuildTranscriptHash(sessionID, handshakeID, sess.ClientEphemeralPublicKey, sess.ClientSessionNonce, agentEphemeral)
 		if !gatewaycrypto.ConstantTimeEqualBase64(expectedTranscript, transcriptHash) {
-			statusCode = fiber.StatusBadRequest
-			errResp = fiber.Map{"error": "transcript hash mismatch"}
-			return
+			return transcriptMismatchErr
 		}
 		if err := gatewaycrypto.VerifyAgentSignature(device.IdentityKey, transcriptHash, agentSignature); err != nil {
-			statusCode = fiber.StatusUnauthorized
-			errResp = fiber.Map{"error": "signature verification failed"}
-			return
+			return signatureErr
 		}
 
-		state.AgentEphemeralPublicKey = agentEphemeral
-		state.AgentIdentitySignature = agentSignature
-		state.TranscriptHash = transcriptHash
-		state.Status = "agent_acknowledged"
-		state.LastError = ""
-		state.UpdatedAt = time.Now().UTC().Unix()
+		sess.AgentEphemeralPublicKey = agentEphemeral
+		sess.AgentIdentitySignature = agentSignature
+		sess.TranscriptHash = transcriptHash
+		sess.Status = "agent_acknowledged"
+		sess.LastError = ""
+		sess.UpdatedAt = time.Now().UTC().Unix()
 
 		event = map[string]any{
 			"type":                       "session.handshake.ack",
-			"status":                     state.Status,
-			"session_id":                 state.SessionID,
-			"handshake_id":               state.HandshakeID,
-			"conversation_id":            state.ConversationID,
-			"device_id":                  state.DeviceID,
-			"agent_ephemeral_public_key": state.AgentEphemeralPublicKey,
-			"agent_identity_signature":   state.AgentIdentitySignature,
-			"transcript_hash":            state.TranscriptHash,
-			"updated_at":                 time.Unix(state.UpdatedAt, 0).UTC().Format(time.RFC3339),
+			"status":                     sess.Status,
+			"session_id":                 sess.SessionID,
+			"handshake_id":               sess.HandshakeID,
+			"conversation_id":            sess.ConversationID,
+			"device_id":                  sess.DeviceID,
+			"agent_ephemeral_public_key": sess.AgentEphemeralPublicKey,
+			"agent_identity_signature":   sess.AgentIdentitySignature,
+			"transcript_hash":            sess.TranscriptHash,
+			"updated_at":                 time.Unix(sess.UpdatedAt, 0).UTC().Format(time.RFC3339),
 		}
 		resp = fiber.Map{
-			"status":          state.Status,
-			"session_id":      state.SessionID,
-			"sessionId":       state.SessionID,
-			"handshake_id":    state.HandshakeID,
-			"handshakeId":     state.HandshakeID,
-			"conversation_id": state.ConversationID,
-			"conversationId":  state.ConversationID,
+			"status":          sess.Status,
+			"session_id":      sess.SessionID,
+			"sessionId":       sess.SessionID,
+			"handshake_id":    sess.HandshakeID,
+			"handshakeId":     sess.HandshakeID,
+			"conversation_id": sess.ConversationID,
+			"conversationId":  sess.ConversationID,
 		}
-	}()
-
+		return nil
+	})
+	if errors.Is(err, handshakeNotFoundErr) {
+		statusCode = fiber.StatusNotFound
+		errResp = fiber.Map{"error": "handshake not found"}
+	}
+	if errors.Is(err, deviceMismatchErr) {
+		statusCode = fiber.StatusBadRequest
+		errResp = fiber.Map{"error": "device_id mismatch for handshake"}
+	}
+	if errors.Is(err, transcriptMismatchErr) {
+		statusCode = fiber.StatusBadRequest
+		errResp = fiber.Map{"error": "transcript hash mismatch"}
+	}
+	if errors.Is(err, signatureErr) {
+		statusCode = fiber.StatusUnauthorized
+		errResp = fiber.Map{"error": "signature verification failed"}
+	}
+	if err != nil && errResp == nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+	}
 	if errResp != nil {
 		return c.Status(statusCode).JSON(errResp)
 	}
 
-	// appendSessionEvent acquires h.mu, so we must not hold state.mu here
+	// appendSessionEvent acquires h.mu.
 	raw, _ := json.Marshal(event)
 	h.appendSessionEvent(sessionID, raw)
 
@@ -387,9 +441,10 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		payload = make(map[string]any)
 	}
 
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	h.mu.RUnlock()
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
@@ -398,12 +453,10 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
-	state.mu.RLock()
 	handshakeStatus := state.Status
 	handshakeID := state.HandshakeID
 	conversationID := state.ConversationID
 	lastSeq := state.SeqClientToAgent
-	state.mu.RUnlock()
 
 	if handshakeStatus != "agent_acknowledged" {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -489,9 +542,17 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 	reservedSeq := 0
 	previousSeq := 0
 	if seq > 0 {
-		state.mu.Lock()
-		if seq <= state.SeqClientToAgent {
-			state.mu.Unlock()
+		replayErr := errors.New("replay_detected")
+		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			if seq <= sess.SeqClientToAgent {
+				return replayErr
+			}
+			previousSeq = sess.SeqClientToAgent
+			sess.SeqClientToAgent = seq
+			sess.UpdatedAt = now.Unix()
+			return nil
+		})
+		if errors.Is(err, replayErr) {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"error":           "replay_detected",
 				"violation":       "replay_detected",
@@ -499,20 +560,22 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 				"conversation_id": conversationID,
 			})
 		}
-		previousSeq = state.SeqClientToAgent
-		state.SeqClientToAgent = seq
-		state.UpdatedAt = now.Unix()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
+		}
+		state = updated
 		reservedSeq = seq
-		state.mu.Unlock()
 	}
 
 	if err := h.sendToAgentForSession(sessionID, payload); err != nil {
 		if reservedSeq > 0 {
-			state.mu.Lock()
-			if state.SeqClientToAgent == reservedSeq {
-				state.SeqClientToAgent = previousSeq
-			}
-			state.mu.Unlock()
+			_, _ = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+				if sess.SeqClientToAgent == reservedSeq {
+					sess.SeqClientToAgent = previousSeq
+					sess.UpdatedAt = time.Now().UTC().Unix()
+				}
+				return nil
+			})
 		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error":           "agent_unavailable",
@@ -553,9 +616,10 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 	}
 	lastEventID := strings.TrimSpace(c.Get("Last-Event-ID"))
 
-	h.mu.RLock()
-	state, found := h.sessions[sessionID]
-	h.mu.RUnlock()
+	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
+	}
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
@@ -662,16 +726,14 @@ func newSessionMessageID() string {
 
 // isSessionMemberDynamic checks whether the given UID currently has access to the session
 // by evaluating device ownership and current grant state dynamically.
-// Must be called without holding h.mu or state.mu.
+// Must be called without holding h.mu.
 func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
 	if state == nil {
 		return false
 	}
 
-	state.mu.RLock()
 	deviceID := state.DeviceID
 	ownerUID := state.OwnerUID
-	state.mu.RUnlock()
 
 	// Owner always has access
 	if uid == ownerUID {
@@ -679,7 +741,5 @@ func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
 	}
 
 	now := time.Now().UTC().Unix()
-	h.mu.RLock()
-	defer h.mu.RUnlock()
 	return h.hasActiveGrantLocked(deviceID, uid, now)
 }

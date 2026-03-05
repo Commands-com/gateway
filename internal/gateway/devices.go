@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -28,11 +29,10 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 		}
 	}
 	now := time.Now().UTC().Unix()
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	rec, exists := h.devices[deviceID]
+	rec, exists, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if exists && rec.OwnerUID != "" && rec.OwnerUID != principal.UID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
@@ -43,7 +43,9 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 		rec.IdentityKey = strings.TrimSpace(req.IdentityKey)
 	}
 	rec.UpdatedAt = now
-	h.devices[deviceID] = rec
+	if err := h.store.SaveDevice(context.Background(), rec); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save device"})
+	}
 
 	return c.JSON(fiber.Map{
 		"deviceId":    rec.DeviceID,
@@ -62,17 +64,16 @@ func (h *Handler) GetDeviceIdentityKey(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	h.mu.RLock()
-	rec, found := h.devices[deviceID]
+	rec, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
+	}
 	if !found {
-		h.mu.RUnlock()
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
 	if !h.canAccessDeviceLocked(principal.UID, deviceID) {
-		h.mu.RUnlock()
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
-	h.mu.RUnlock()
 
 	return c.JSON(fiber.Map{
 		"deviceId":    rec.DeviceID,
@@ -82,8 +83,8 @@ func (h *Handler) GetDeviceIdentityKey(c fiber.Ctx) error {
 }
 
 func (h *Handler) canAccessDeviceLocked(uid, deviceID string) bool {
-	device, exists := h.devices[deviceID]
-	if !exists {
+	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil || !found {
 		return false
 	}
 	if device.OwnerUID == uid {

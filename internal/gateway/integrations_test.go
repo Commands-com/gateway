@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/base64"
 	"io"
 	"net/http/httptest"
@@ -45,13 +46,24 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 		ownerUID:        "owner1",
 		activatedRoutes: map[string]bool{routeID: true},
 	}
-	h.mu.Lock()
-	route := h.integrationRoutes[routeID]
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || route == nil {
+		t.Fatalf("expected route to exist, found=%v err=%v", found, err)
+	}
 	route.Status = "active"
 	route.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		t.Fatalf("save route failed: %v", err)
+	}
+	if err := h.store.SetActiveRouteDevice(context.Background(), routeID, tc.deviceID); err != nil {
+		t.Fatalf("set active route failed: %v", err)
+	}
+	h.mu.Lock()
 	h.tunnelConns[tc.deviceID] = tc
-	h.activeRoutes[routeID] = tc.deviceID
 	h.mu.Unlock()
+	if _, ok, err := h.store.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil || !ok {
+		t.Fatalf("expected route lease claim to succeed, err=%v", err)
+	}
 
 	h.tunnelWriteFn = func(conn *tunnelConn, frame map[string]any) error {
 		requestID := firstStringMap(frame, "request_id")
@@ -127,6 +139,154 @@ func TestIngressRejectsTokenMismatch(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("expected tunnel not to be called on token mismatch")
+	}
+}
+
+func TestIngressRejectsWhenLeaseOwnedByRemoteNode(t *testing.T) {
+	h := NewHandlerWithOptions(
+		&config.Config{
+			FrontendURL:   "https://frontend.example",
+			StateBackend:  config.StateBackendMemory,
+			PublicBaseURL: "http://localhost:8080",
+		},
+		HandlerOptions{NodeID: "node-local-a"},
+	)
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	routeID, _ := routeObj["route_id"].(string)
+	routeToken, _ := createResp["route_token"].(string)
+	if routeID == "" || routeToken == "" {
+		t.Fatalf("expected route_id and route_token in create response")
+	}
+
+	tc := &tunnelConn{
+		deviceID:        "devowner1",
+		ownerUID:        "owner1",
+		activatedRoutes: map[string]bool{routeID: true},
+	}
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || route == nil {
+		t.Fatalf("expected route to exist, found=%v err=%v", found, err)
+	}
+	route.Status = "active"
+	route.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		t.Fatalf("save route failed: %v", err)
+	}
+	if err := h.store.SetActiveRouteDevice(context.Background(), routeID, tc.deviceID); err != nil {
+		t.Fatalf("set active route failed: %v", err)
+	}
+	h.mu.Lock()
+	h.tunnelConns[tc.deviceID] = tc
+	h.mu.Unlock()
+	if _, ok, err := h.store.ClaimRouteLease(context.Background(), routeID, "node-remote", routeLeaseTTL); err != nil || !ok {
+		t.Fatalf("expected remote lease claim to succeed, err=%v", err)
+	}
+
+	calls := 0
+	h.tunnelWriteFn = func(_ *tunnelConn, _ map[string]any) error {
+		calls++
+		return nil
+	}
+
+	req := httptest.NewRequest("POST", "/integrations/"+routeID+"/"+routeToken, nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("ingress request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when lease is owned by remote node, got %d", resp.StatusCode)
+	}
+	if calls != 0 {
+		t.Fatalf("expected tunnel dispatch not to run when lease owner is remote")
+	}
+}
+
+func TestTunnelLeaseRenewalDropsLostRoute(t *testing.T) {
+	h := NewHandlerWithOptions(
+		&config.Config{
+			FrontendURL:   "https://frontend.example",
+			StateBackend:  config.StateBackendMemory,
+			PublicBaseURL: "http://localhost:8080",
+		},
+		HandlerOptions{NodeID: "node-local-a"},
+	)
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	routeID, _ := routeObj["route_id"].(string)
+	if routeID == "" {
+		t.Fatalf("expected route_id in create response")
+	}
+
+	tc := &tunnelConn{
+		deviceID:        "devowner1",
+		ownerUID:        "owner1",
+		activatedRoutes: map[string]bool{routeID: true},
+	}
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || route == nil {
+		t.Fatalf("expected route to exist, found=%v err=%v", found, err)
+	}
+	route.Status = "active"
+	route.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		t.Fatalf("save route failed: %v", err)
+	}
+	if err := h.store.SetActiveRouteDevice(context.Background(), routeID, tc.deviceID); err != nil {
+		t.Fatalf("set active route failed: %v", err)
+	}
+	h.mu.Lock()
+	h.tunnelConns[tc.deviceID] = tc
+	h.mu.Unlock()
+	if _, ok, err := h.store.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil || !ok {
+		t.Fatalf("expected local lease claim to succeed, err=%v", err)
+	}
+	if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
+		t.Fatalf("release lease failed: %v", err)
+	}
+
+	h.renewTunnelLeases(tc)
+
+	h.mu.RLock()
+	_, stillActive := tc.activatedRoutes[routeID]
+	h.mu.RUnlock()
+	if stillActive {
+		t.Fatalf("expected lost lease route to be removed from tunnel activated routes")
+	}
+	if _, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID); err != nil || active {
+		t.Fatalf("expected active route binding to be cleared, active=%v err=%v", active, err)
+	}
+	updatedRoute, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || updatedRoute == nil {
+		t.Fatalf("expected route to exist after lease loss, found=%v err=%v", found, err)
+	}
+	if updatedRoute.Status != "inactive" {
+		t.Fatalf("expected route status inactive after lease loss, got %s", updatedRoute.Status)
 	}
 }
 

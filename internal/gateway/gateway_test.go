@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -104,10 +105,12 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		"deviceId": "devcollab1",
 	}, "collab1", "collab@example.com", fiber.StatusOK)
 
-	h.mu.RLock()
-	indexed := len(h.grantsByDevice["devowner1"])
+	grantsBefore, err := h.store.ListShareGrantsByDevice(context.Background(), "devowner1")
+	if err != nil {
+		t.Fatalf("list grants by device before revoke failed: %v", err)
+	}
+	indexed := len(grantsBefore)
 	hasAccessBeforeRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
-	h.mu.RUnlock()
 	if indexed != 1 {
 		t.Fatalf("expected 1 indexed grant for device, got %d", indexed)
 	}
@@ -117,10 +120,12 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 
 	mustDoJSON(t, app, "POST", "/gateway/v1/shares/grants/"+grantID+"/revoke", nil, "owner1", "owner@example.com", fiber.StatusOK)
 
-	h.mu.RLock()
-	indexed = len(h.grantsByDevice["devowner1"])
+	grantsAfter, err := h.store.ListShareGrantsByDevice(context.Background(), "devowner1")
+	if err != nil {
+		t.Fatalf("list grants by device after revoke failed: %v", err)
+	}
+	indexed = len(grantsAfter)
 	hasAccessAfterRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
-	h.mu.RUnlock()
 	if indexed != 0 {
 		t.Fatalf("expected 0 indexed grants after revoke, got %d", indexed)
 	}

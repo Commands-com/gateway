@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,6 +22,8 @@ const (
 	tunnelPongTimeout     = 10 * time.Second
 	inflightSweepInterval = 10 * time.Second
 	inflightRequestMaxAge = 2 * time.Minute
+	routeLeaseTTL         = 15 * time.Second
+	routeLeaseRenewEvery  = 5 * time.Second
 )
 
 var wsConnIDCounter uint64
@@ -82,9 +85,10 @@ func (h *Handler) RequireIntegrationTunnelUpgrade(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id query param is required"})
 	}
 
-	h.mu.RLock()
-	device, found := h.devices[deviceID]
-	h.mu.RUnlock()
+	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal_error"})
+	}
 	if !found {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_not_found"})
 	}
@@ -154,6 +158,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	})
 
 	stopPing := make(chan struct{})
+	stopLease := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(tunnelPingInterval)
 		defer ticker.Stop()
@@ -171,6 +176,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 			}
 		}
 	}()
+	go h.startTunnelLeaseHeartbeat(state, stopLease)
 
 	c.SetPongHandler(func(string) error {
 		h.mu.Lock()
@@ -200,6 +206,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	}
 
 	close(stopPing)
+	close(stopLease)
 
 	wasActive := false
 	h.mu.Lock()
@@ -268,10 +275,18 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 		var supersededTunnel *tunnelConn
 		result := map[string]any{}
 
-		h.mu.Lock()
-		route, found := h.integrationRoutes[routeID]
+		route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
 		switch {
-		case !found:
+		case err != nil:
+			result = map[string]any{
+				"route_id": routeID,
+				"status":   "rejected",
+				"error": map[string]string{
+					"code":    "internal_error",
+					"message": "Failed to load route state",
+				},
+			}
+		case !found || route == nil:
 			result = map[string]any{
 				"route_id": routeID,
 				"status":   "rejected",
@@ -308,24 +323,102 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				},
 			}
 		default:
-			if existingDeviceID, active := h.activeRoutes[routeID]; active && existingDeviceID != tc.deviceID {
+			lease, claimed, err := h.store.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL)
+			if err != nil {
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to claim route lease",
+					},
+				}
+				break
+			}
+			if !claimed {
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "route_claimed_elsewhere",
+						"message": fmt.Sprintf("Route is currently claimed by node %s", lease.NodeID),
+					},
+				}
+				break
+			}
+
+			existingDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+			if err != nil {
+				_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to load active route state",
+					},
+				}
+				break
+			}
+			if active && existingDeviceID != tc.deviceID {
+				h.mu.Lock()
 				if old, hasOld := h.tunnelConns[existingDeviceID]; hasOld {
 					delete(old.activatedRoutes, routeID)
 					supersededTunnel = old
 				}
+				h.mu.Unlock()
 				activation = "superseded"
 			}
-			h.activeRoutes[routeID] = tc.deviceID
+			if err := h.store.SetActiveRouteDevice(context.Background(), routeID, tc.deviceID); err != nil {
+				if !active {
+					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				}
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to activate route",
+					},
+				}
+				break
+			}
+			h.mu.Lock()
 			tc.activatedRoutes[routeID] = true
+			h.mu.Unlock()
 			route.Status = "active"
 			route.UpdatedAt = now
+			if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+				if active {
+					_ = h.store.SetActiveRouteDevice(context.Background(), routeID, existingDeviceID)
+					if supersededTunnel != nil {
+						h.mu.Lock()
+						supersededTunnel.activatedRoutes[routeID] = true
+						h.mu.Unlock()
+					}
+				} else {
+					_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				}
+				h.mu.Lock()
+				delete(tc.activatedRoutes, routeID)
+				h.mu.Unlock()
+				result = map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to persist route activation",
+					},
+				}
+				break
+			}
 			result = map[string]any{
 				"route_id":   routeID,
 				"status":     "active",
 				"activation": activation,
 			}
 		}
-		h.mu.Unlock()
 
 		if supersededTunnel != nil {
 			_ = supersededTunnel.writeJSON(map[string]any{
@@ -371,19 +464,74 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 			continue
 		}
 
-		h.mu.Lock()
-		if activeDeviceID, active := h.activeRoutes[routeID]; active && activeDeviceID == tc.deviceID {
-			delete(h.activeRoutes, routeID)
+		activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+		if err != nil {
+			results = append(results, map[string]any{
+				"route_id": routeID,
+				"status":   "rejected",
+				"error": map[string]string{
+					"code":    "internal_error",
+					"message": "Failed to load active route state",
+				},
+			})
+			continue
+		}
+		if active && activeDeviceID == tc.deviceID {
+			if err := h.store.DeleteActiveRoute(context.Background(), routeID); err != nil {
+				results = append(results, map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to deactivate route",
+					},
+				})
+				continue
+			}
+			h.mu.Lock()
 			delete(tc.activatedRoutes, routeID)
-			if route, found := h.integrationRoutes[routeID]; found {
+			h.mu.Unlock()
+			if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
+				results = append(results, map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to release route lease",
+					},
+				})
+				continue
+			}
+			route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+			if err != nil {
+				results = append(results, map[string]any{
+					"route_id": routeID,
+					"status":   "rejected",
+					"error": map[string]string{
+						"code":    "internal_error",
+						"message": "Failed to load route state",
+					},
+				})
+				continue
+			}
+			if found && route != nil {
 				route.Status = "inactive"
 				route.UpdatedAt = now
+				if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+					results = append(results, map[string]any{
+						"route_id": routeID,
+						"status":   "rejected",
+						"error": map[string]string{
+							"code":    "internal_error",
+							"message": "Failed to persist route state",
+						},
+					})
+					continue
+				}
 			}
-			h.mu.Unlock()
 			results = append(results, map[string]any{"route_id": routeID, "status": "inactive"})
 			continue
 		}
-		h.mu.Unlock()
 		results = append(results, map[string]any{
 			"route_id": routeID,
 			"status":   "rejected",
@@ -471,21 +619,36 @@ func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	h.mu.Lock()
-	routesToDeactivate := make([]string, 0, len(tc.activatedRoutes))
+	routeIDs := make([]string, 0, len(tc.activatedRoutes))
 	for routeID := range tc.activatedRoutes {
-		if activeDeviceID, active := h.activeRoutes[routeID]; active && activeDeviceID == tc.deviceID {
-			delete(h.activeRoutes, routeID)
-			routesToDeactivate = append(routesToDeactivate, routeID)
-		}
+		routeIDs = append(routeIDs, routeID)
 	}
 	tc.activatedRoutes = make(map[string]bool)
-	for _, routeID := range routesToDeactivate {
-		if route, found := h.integrationRoutes[routeID]; found && route.Status != "revoked" {
-			route.Status = "provisioned"
-			route.UpdatedAt = now
+	h.mu.Unlock()
+
+	routesToDeactivate := make([]string, 0, len(routeIDs))
+	for _, routeID := range routeIDs {
+		activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+		if err != nil || !active || activeDeviceID != tc.deviceID {
+			continue
+		}
+		if err := h.store.DeleteActiveRoute(context.Background(), routeID); err != nil {
+			continue
+		}
+		if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
+			log.Printf("[tunnel] failed to release lease route=%s: %v", routeID, err)
+		}
+		routesToDeactivate = append(routesToDeactivate, routeID)
+		route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+		if err != nil || !found || route == nil || route.Status == "revoked" {
+			continue
+		}
+		route.Status = "provisioned"
+		route.UpdatedAt = now
+		if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+			log.Printf("[tunnel] failed to persist deactivation route=%s: %v", routeID, err)
 		}
 	}
-	h.mu.Unlock()
 
 	if reason != "" {
 		log.Printf("[tunnel] deactivated %d routes for device=%s reason=%s", len(routesToDeactivate), tc.deviceID, reason)
@@ -499,17 +662,32 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 		requestFrame["request_id"] = requestID
 	}
 
-	h.mu.Lock()
-	_ = h.pruneStaleInflightRequestsLocked(time.Now().UTC())
-	deviceID, active := h.activeRoutes[routeID]
+	deviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+	if err != nil {
+		return nil, fmt.Errorf("active_route_lookup_failed: %w", err)
+	}
 	if !active {
-		h.mu.Unlock()
 		return nil, fmt.Errorf("tunnel_not_connected")
 	}
+	lease, claimed, err := h.store.GetRouteLease(context.Background(), routeID)
+	if err != nil {
+		return nil, fmt.Errorf("route_lease_lookup_failed: %w", err)
+	}
+	if !claimed {
+		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+		return nil, fmt.Errorf("route_not_claimed")
+	}
+	if lease.NodeID != h.nodeID {
+		return nil, fmt.Errorf("route_claimed_by_remote_node")
+	}
+
+	h.mu.Lock()
+	_ = h.pruneStaleInflightRequestsLocked(time.Now().UTC())
 	tunnel, ok := h.tunnelConns[deviceID]
 	if !ok || tunnel == nil {
-		delete(h.activeRoutes, routeID)
 		h.mu.Unlock()
+		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+		_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
 		return nil, fmt.Errorf("tunnel_not_connected")
 	}
 	if len(h.inflightRequests) >= maxInflightRequests {
@@ -541,6 +719,82 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 	}
 
 	return inflight, nil
+}
+
+func (h *Handler) startTunnelLeaseHeartbeat(tc *tunnelConn, stop <-chan struct{}) {
+	ticker := time.NewTicker(routeLeaseRenewEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-stop:
+			return
+		case <-ticker.C:
+			h.renewTunnelLeases(tc)
+		}
+	}
+}
+
+func (h *Handler) renewTunnelLeases(tc *tunnelConn) {
+	h.mu.RLock()
+	current, ok := h.tunnelConns[tc.deviceID]
+	if !ok || current != tc {
+		h.mu.RUnlock()
+		return
+	}
+	routeIDs := make([]string, 0, len(tc.activatedRoutes))
+	for routeID := range tc.activatedRoutes {
+		routeIDs = append(routeIDs, routeID)
+	}
+	h.mu.RUnlock()
+
+	for _, routeID := range routeIDs {
+		if _, renewed, err := h.store.RenewRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil {
+			log.Printf("[tunnel] lease_renew_failed route=%s err=%v", routeID, err)
+			continue
+		} else if !renewed {
+			h.handleLostTunnelLease(tc, routeID)
+		}
+	}
+}
+
+func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	h.mu.Lock()
+	current, ok := h.tunnelConns[tc.deviceID]
+	if !ok || current != tc {
+		h.mu.Unlock()
+		return
+	}
+	if !tc.activatedRoutes[routeID] {
+		h.mu.Unlock()
+		return
+	}
+	delete(tc.activatedRoutes, routeID)
+	h.mu.Unlock()
+
+	activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+	if err == nil && active && activeDeviceID == tc.deviceID {
+		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+	}
+	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err == nil && found && route != nil && route.Status != "revoked" {
+		route.Status = "inactive"
+		route.UpdatedAt = now
+		_ = h.store.SaveIntegrationRoute(context.Background(), route)
+	}
+
+	if tc.conn != nil {
+		_ = tc.writeJSON(map[string]any{
+			"type":     "tunnel.route_deactivated",
+			"route_id": routeID,
+			"reason":   "lease_lost",
+			"at":       now,
+		})
+	}
 }
 
 func (h *Handler) startInflightSweeper() {
