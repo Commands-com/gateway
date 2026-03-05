@@ -14,6 +14,8 @@ import (
 )
 
 func TestGatewayScopeEnforcement(t *testing.T) {
+	validIdentityKey := "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
+
 	cfg := &config.Config{
 		Port:                        "8080",
 		PublicBaseURL:               "http://localhost:8080",
@@ -64,7 +66,7 @@ func TestGatewayScopeEnforcement(t *testing.T) {
 		t.Fatalf("expected insufficient_scope for share endpoint, got %v", body)
 	}
 
-	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": "pub"}, tokenSession)
+	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": validIdentityKey}, tokenSession)
 	if status != fiber.StatusForbidden {
 		t.Fatalf("expected 403 for missing device scope, got %d body=%v", status, body)
 	}
@@ -72,7 +74,7 @@ func TestGatewayScopeEnforcement(t *testing.T) {
 		t.Fatalf("expected insufficient_scope for device endpoint, got %v", body)
 	}
 
-	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": "pub"}, tokenDevice)
+	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": validIdentityKey}, tokenDevice)
 	if status != fiber.StatusOK {
 		t.Fatalf("expected device-scoped token to pass, got %d body=%v", status, body)
 	}

@@ -235,7 +235,9 @@ paths:
   /gateway/v1/sessions/{session_id}/handshake/client-init:
     post:
       summary: Initialize a relay session handshake
-      description: Requires `gateway:session` scope.
+      description: |
+        Requires `gateway:session` scope.
+        Creates or reuses a secure handshake and forwards `session.handshake.request` to the connected agent.
       parameters:
         - in: path
           name: session_id
@@ -247,12 +249,16 @@ paths:
           application/json:
             schema:
               type: object
-              required: [deviceId]
+              required: [device_id, handshake_id, client_ephemeral_public_key, client_session_nonce]
               properties:
-                deviceId: { type: string }
+                device_id: { type: string }
+                handshake_id: { type: string }
+                conversation_id: { type: string }
+                client_ephemeral_public_key: { type: string }
+                client_session_nonce: { type: string }
       responses:
-        '201':
-          description: Handshake created
+        '202':
+          description: Handshake accepted
   /gateway/v1/sessions/{session_id}/handshake/{handshake_id}:
     get:
       summary: Retrieve handshake state
@@ -272,24 +278,63 @@ paths:
   /gateway/v1/sessions/{session_id}/handshake/agent-ack:
     post:
       summary: Agent acknowledgment for handshake
-      description: Requires `device` scope.
+      description: |
+        Requires `device` scope.
+        Verifies transcript hash and agent identity signature before promoting handshake to `agent_acknowledged`.
       parameters:
         - in: path
           name: session_id
           required: true
           schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, handshake_id, agent_ephemeral_public_key, agent_identity_signature, transcript_hash]
+              properties:
+                device_id: { type: string }
+                handshake_id: { type: string }
+                agent_ephemeral_public_key: { type: string }
+                agent_identity_signature: { type: string }
+                transcript_hash: { type: string }
       responses:
-        '200':
+        '202':
           description: Acknowledged
   /gateway/v1/sessions/{session_id}/messages:
     post:
       summary: Send session message
-      description: Requires `gateway:session` scope.
+      description: |
+        Requires `gateway:session` scope.
+        Requires `X-Idempotency-Key`.
+        Enforces encrypted envelope and monotonic `seq` replay protection by default.
       parameters:
         - in: path
           name: session_id
           required: true
           schema: { type: string }
+        - in: header
+          name: X-Idempotency-Key
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [encrypted, ciphertext, nonce, tag, seq]
+              properties:
+                type: { type: string, example: session.message }
+                message_id: { type: string }
+                handshake_id: { type: string }
+                conversation_id: { type: string }
+                encrypted: { type: boolean, example: true }
+                ciphertext: { type: string }
+                nonce: { type: string }
+                tag: { type: string }
+                seq: { type: integer, minimum: 1 }
       responses:
         '202':
           description: Accepted
@@ -317,11 +362,18 @@ paths:
       x-commands-websocket:
         frame_types:
           - gateway.connected
+          - transport.init
+          - session.handshake.request
+          - session.handshake.ack
           - session.message
           - session.progress
           - session.result
           - session.error
           - heartbeat
+        security:
+          outgoing_agent_frames_require:
+            - transport_token
+            - t_seq
 
   /gateway/v1/integrations/routes:
     post:

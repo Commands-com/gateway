@@ -21,7 +21,9 @@ func TestShareInviteAcceptAndList(t *testing.T) {
 	})
 	app := newGatewayTestApp(h)
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	collabIdentityKey, _ := testEd25519Identity("collab1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 
 	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
 		"deviceId": "devowner1",
@@ -38,7 +40,7 @@ func TestShareInviteAcceptAndList(t *testing.T) {
 		t.Fatalf("expected invite token in inviteUrl")
 	}
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": "collab-key"}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
 
 	acceptResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
 		"token":    token,
@@ -77,7 +79,9 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 	})
 	app := newGatewayTestApp(h)
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, ownerIdentityPriv := testEd25519Identity("owner1")
+	collabIdentityKey, _ := testEd25519Identity("collab1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 
 	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
 		"deviceId": "devowner1",
@@ -86,28 +90,67 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 	inviteURL, _ := inviteResp["inviteUrl"].(string)
 	token := inviteURL[strings.LastIndex(inviteURL, "/")+1:]
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": "collab-key"}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
 	mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
 		"token":    token,
 		"deviceId": "devcollab1",
 	}, "collab1", "collab@example.com", fiber.StatusOK)
 
-	handshake := mustDoJSON(t, app, "POST", "/gateway/v1/sessions/sessabc1/handshake/client-init", map[string]any{"deviceId": "devowner1"}, "collab1", "collab@example.com", fiber.StatusCreated)
-	if handshake["status"] != "agent_acknowledged" {
-		t.Fatalf("expected handshake status agent_acknowledged, got %v", handshake["status"])
+	clientEphemeral := testX25519Public("client-ephemeral")
+	clientNonce := testNonce("client-nonce")
+	handshakeID := "hs_secure_abc1"
+	handshake := mustDoJSON(t, app, "POST", "/gateway/v1/sessions/sessabc1/handshake/client-init", map[string]any{
+		"device_id":                   "devowner1",
+		"client_ephemeral_public_key": clientEphemeral,
+		"client_session_nonce":        clientNonce,
+		"handshake_id":                handshakeID,
+	}, "collab1", "collab@example.com", fiber.StatusAccepted)
+	if handshake["status"] != "pending_agent_connection" {
+		t.Fatalf("expected handshake status pending_agent_connection, got %v", handshake["status"])
 	}
 
-	mustDoJSON(t, app, "POST", "/gateway/v1/sessions/sessabc1/messages", map[string]any{"message_id": "msg-1", "content": "hello"}, "collab1", "collab@example.com", fiber.StatusAccepted)
+	ackPayload := testSignedHandshakeAck(t, "sessabc1", handshakeID, clientEphemeral, clientNonce, ownerIdentityPriv)
+	ackPayload["device_id"] = "devowner1"
+	ackPayload["handshake_id"] = handshakeID
+	mustDoJSON(t, app, "POST", "/gateway/v1/sessions/sessabc1/handshake/agent-ack", ackPayload, "owner1", "owner@example.com", fiber.StatusAccepted)
+
+	var forwarded map[string]any
+	h.mu.Lock()
+	h.agents["devowner1"] = &agentConn{deviceID: "devowner1", ownerUID: "owner1"}
+	h.mu.Unlock()
+	h.agentWriteFn = func(_ *agentConn, payload map[string]any) error {
+		forwarded = payload
+		return nil
+	}
+
+	mustDoJSONWithHeaders(t, app, "POST", "/gateway/v1/sessions/sessabc1/messages", map[string]any{
+		"message_id": "msg-1",
+		"encrypted":  true,
+		"ciphertext": "abc",
+		"nonce":      "def",
+		"tag":        "ghi",
+		"seq":        1,
+	}, "collab1", "collab@example.com", fiber.StatusAccepted, map[string]string{"X-Idempotency-Key": "idem-1"})
+	if forwarded == nil || firstStringMap(forwarded, "message_id") != "msg-1" {
+		t.Fatalf("expected forwarded agent payload with message_id msg-1")
+	}
 
 	events := h.replayEvents("sessabc1", "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (handshake ack + message), got %d", len(events))
 	}
-	if !strings.Contains(string(events[0].Data), "msg-1") {
-		t.Fatalf("expected event payload to contain message_id msg-1")
+	if !strings.Contains(string(events[1].Data), "msg-1") {
+		t.Fatalf("expected latest event payload to contain message_id msg-1")
 	}
 
-	mustDoJSON(t, app, "POST", "/gateway/v1/sessions/sessabc1/messages", map[string]any{"message_id": "msg-2", "content": "nope"}, "stranger1", "stranger@example.com", fiber.StatusForbidden)
+	mustDoJSONWithHeaders(t, app, "POST", "/gateway/v1/sessions/sessabc1/messages", map[string]any{
+		"message_id": "msg-2",
+		"encrypted":  true,
+		"ciphertext": "abc",
+		"nonce":      "def",
+		"tag":        "ghi",
+		"seq":        2,
+	}, "stranger1", "stranger@example.com", fiber.StatusForbidden, map[string]string{"X-Idempotency-Key": "idem-2"})
 }
 
 func newGatewayTestApp(h *Handler) *fiber.App {
@@ -151,6 +194,20 @@ func mustDoJSON(
 	email string,
 	expectedStatus int,
 ) map[string]any {
+	return mustDoJSONWithHeaders(t, app, method, path, payload, uid, email, expectedStatus, nil)
+}
+
+func mustDoJSONWithHeaders(
+	t *testing.T,
+	app *fiber.App,
+	method string,
+	path string,
+	payload map[string]any,
+	uid string,
+	email string,
+	expectedStatus int,
+	extraHeaders map[string]string,
+) map[string]any {
 	t.Helper()
 
 	var body []byte
@@ -171,6 +228,9 @@ func mustDoJSON(
 	}
 	if email != "" {
 		req.Header.Set("X-Test-Email", email)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := app.Test(req)

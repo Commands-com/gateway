@@ -116,6 +116,29 @@ Public ingress uses in-memory fixed-window limits (default 60s window):
 - `INGRESS_IP_LIMIT_PER_WINDOW` (default `600`)
 - `INGRESS_ROUTE_LIMIT_PER_WINDOW` (default `300`)
 
+## Relay Security Defaults
+
+- Handshake requires:
+  - `device_id`
+  - `handshake_id`
+  - `client_ephemeral_public_key` (32-byte base64 value)
+  - `client_session_nonce`
+- Agent ack is signature-verified against device identity key.
+- Session messages require `X-Idempotency-Key`.
+- Encrypted envelope (`encrypted`, `ciphertext`, `nonce`, `tag`, `seq`) is enforced by default.
+- Replay checks are enforced in-memory for:
+  - `client_to_agent` message `seq`
+  - `agent_to_client` frame `seq`
+- WebSocket transport replay protection is enabled when `TRANSPORT_TOKEN_SECRET` is set.
+  - If unset in env, it defaults to `JWT_SIGNING_KEY`.
+
+Config knobs:
+
+- `IDEMPOTENCY_TTL_SECONDS` (default `300`)
+- `REQUIRE_ENCRYPTED_FRAMES` (default `true`)
+- `TRANSPORT_TOKEN_SECRET` (default: `JWT_SIGNING_KEY`)
+- `TRANSPORT_TOKEN_TTL_SECONDS` (default `3600`)
+
 ## Endpoint Contract
 
 - OpenAPI-level contract: [`docs/openapi.yaml`](./docs/openapi.yaml)

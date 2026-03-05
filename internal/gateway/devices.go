@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"oss-commands-gateway/internal/auth"
+	"oss-commands-gateway/internal/gatewaycrypto"
 )
 
 func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
@@ -21,6 +22,11 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 
 	var req putDeviceIdentityKeyRequest
 	_ = c.Bind().Body(&req)
+	if strings.TrimSpace(req.IdentityKey) != "" {
+		if err := gatewaycrypto.ValidateEd25519PublicKey(strings.TrimSpace(req.IdentityKey)); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid identity key"})
+		}
+	}
 	now := time.Now().UTC().Unix()
 
 	h.mu.Lock()

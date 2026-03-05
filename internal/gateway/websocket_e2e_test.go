@@ -20,28 +20,64 @@ import (
 )
 
 func TestAgentWebSocketReconnectE2E(t *testing.T) {
-	h := NewHandler(&config.Config{StateBackend: config.StateBackendMemory, PublicBaseURL: "http://localhost:8080", FrontendURL: "https://example.com"})
+	ownerIdentityKey, ownerIdentityPriv := testEd25519Identity("owner1")
+	sessionID := "sessws1"
+	handshakeID := "hsws1"
+	clientEphemeral := testX25519Public("client-e2e")
+	clientNonce := testNonce("nonce-e2e")
+
+	h := NewHandler(&config.Config{
+		StateBackend:           config.StateBackendMemory,
+		PublicBaseURL:          "http://localhost:8080",
+		FrontendURL:            "https://example.com",
+		RequireEncryptedFrames: true,
+		IdempotencyTTLSeconds:  300,
+		TransportTokenSecret:   "transport-secret-for-tests",
+		TransportTokenTTL:      time.Hour,
+	})
 	httpBase, wsBase, cleanup := startGatewayWSHarness(t, h)
 	defer cleanup()
 
 	client := &http.Client{Timeout: 3 * time.Second}
 
-	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
-	mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/sessions/sessws1/handshake/client-init", map[string]any{"deviceId": "devowner1"}, "owner1", "owner@example.com", fiber.StatusCreated)
+	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/sessions/"+sessionID+"/handshake/client-init", map[string]any{
+		"device_id":                   "devowner1",
+		"client_ephemeral_public_key": clientEphemeral,
+		"client_session_nonce":        clientNonce,
+		"handshake_id":                handshakeID,
+	}, "owner1", "owner@example.com", fiber.StatusAccepted)
 
 	agentURL := wsBase + "/gateway/v1/agent/connect?device_id=devowner1"
 	conn1 := mustDialWS(t, agentURL, "owner1", "owner@example.com")
 	defer conn1.Close()
-	connected1 := mustReadWSJSON(t, conn1, 2*time.Second)
+	connected1 := mustReadWSJSONByType(t, conn1, 2*time.Second, "gateway.connected")
 	if connected1["type"] != "gateway.connected" {
 		t.Fatalf("expected gateway.connected on first connection, got %v", connected1)
+	}
+	transportInit1 := mustReadWSJSONByType(t, conn1, 2*time.Second, "transport.init")
+	if strings.TrimSpace(asString(transportInit1["transport_token"])) == "" {
+		t.Fatalf("expected transport token on first connection")
+	}
+	handshakeRequest1 := mustReadWSJSONByType(t, conn1, 2*time.Second, "session.handshake.request")
+	if handshakeRequest1["handshake_id"] != handshakeID {
+		t.Fatalf("expected handshake request %s on first connection, got %v", handshakeID, handshakeRequest1)
 	}
 
 	conn2 := mustDialWS(t, agentURL, "owner1", "owner@example.com")
 	defer conn2.Close()
-	connected2 := mustReadWSJSON(t, conn2, 2*time.Second)
+	connected2 := mustReadWSJSONByType(t, conn2, 2*time.Second, "gateway.connected")
 	if connected2["type"] != "gateway.connected" {
 		t.Fatalf("expected gateway.connected on second connection, got %v", connected2)
+	}
+	transportInit2 := mustReadWSJSONByType(t, conn2, 2*time.Second, "transport.init")
+	transportToken2 := strings.TrimSpace(asString(transportInit2["transport_token"]))
+	if transportToken2 == "" {
+		t.Fatalf("expected transport token on second connection")
+	}
+	handshakeRequest2 := mustReadWSJSONByType(t, conn2, 2*time.Second, "session.handshake.request")
+	if handshakeRequest2["handshake_id"] != handshakeID {
+		t.Fatalf("expected handshake request %s on second connection, got %v", handshakeID, handshakeRequest2)
 	}
 
 	conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -49,12 +85,38 @@ func TestAgentWebSocketReconnectE2E(t *testing.T) {
 		t.Fatalf("expected first websocket to be closed after reconnect")
 	}
 
-	mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/sessions/sessws1/messages", map[string]any{
-		"message_id": "m-reconnect",
-		"content":    "hello",
-	}, "owner1", "owner@example.com", fiber.StatusAccepted)
+	ackPayload := testSignedHandshakeAck(t, sessionID, handshakeID, clientEphemeral, clientNonce, ownerIdentityPriv)
+	ackPayload["type"] = "session.handshake.ack"
+	ackPayload["session_id"] = sessionID
+	ackPayload["handshake_id"] = handshakeID
+	ackPayload["transport_token"] = transportToken2
+	ackPayload["t_seq"] = 1
+	mustWriteWSJSON(t, conn2, ackPayload)
 
-	frame := mustReadWSJSON(t, conn2, 2*time.Second)
+	var handshakeState map[string]any
+	for i := 0; i < 10; i++ {
+		handshakeState = mustHTTPJSON(t, client, fiber.MethodGet, httpBase+"/gateway/v1/sessions/"+sessionID+"/handshake/"+handshakeID, nil, "owner1", "owner@example.com", fiber.StatusOK)
+		if handshakeState["status"] == "agent_acknowledged" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if handshakeState["status"] != "agent_acknowledged" {
+		t.Fatalf("expected handshake to be acknowledged, got %v", handshakeState)
+	}
+
+	mustHTTPJSONWithHeaders(t, client, fiber.MethodPost, httpBase+"/gateway/v1/sessions/"+sessionID+"/messages", map[string]any{
+		"type":         "session.message",
+		"message_id":   "m-reconnect",
+		"handshake_id": handshakeID,
+		"encrypted":    true,
+		"ciphertext":   "cipher",
+		"nonce":        "nonce",
+		"tag":          "tag",
+		"seq":          1,
+	}, "owner1", "owner@example.com", fiber.StatusAccepted, map[string]string{"X-Idempotency-Key": "ws-idem-1"})
+
+	frame := mustReadWSJSONByType(t, conn2, 2*time.Second, "session.message")
 	if frame["type"] != "session.message" {
 		t.Fatalf("expected session.message frame after reconnect, got %v", frame)
 	}
@@ -70,7 +132,8 @@ func TestTunnelIngressReconnectE2E(t *testing.T) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 	createResp := mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -192,6 +255,7 @@ func startGatewayWSHarness(t *testing.T, h *Handler) (string, string, func()) {
 	group := app.Group("/gateway/v1")
 	group.Put("/devices/:device_id/identity-key", h.PutDeviceIdentityKey)
 	group.Post("/sessions/:session_id/handshake/client-init", h.PostHandshakeClientInit)
+	group.Get("/sessions/:session_id/handshake/:handshake_id", h.GetHandshake)
 	group.Post("/sessions/:session_id/messages", h.PostSessionMessage)
 	group.Post("/integrations/routes", h.CreateIntegrationRoute)
 	group.Use("/agent/connect", h.RequireAgentWebSocketUpgrade)
@@ -258,6 +322,21 @@ func mustReadWSJSON(t *testing.T, conn *fastws.Conn, timeout time.Duration) map[
 	return frame
 }
 
+func mustReadWSJSONByType(t *testing.T, conn *fastws.Conn, timeout time.Duration, frameType string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("timed out waiting for websocket frame type %q", frameType)
+		}
+		frame := mustReadWSJSON(t, conn, remaining)
+		if strings.TrimSpace(asString(frame["type"])) == frameType {
+			return frame
+		}
+	}
+}
+
 func mustWriteWSJSON(t *testing.T, conn *fastws.Conn, payload map[string]any) {
 	t.Helper()
 	raw, err := json.Marshal(payload)
@@ -278,6 +357,20 @@ func mustHTTPJSON(
 	uid string,
 	email string,
 	expectedStatus int,
+) map[string]any {
+	return mustHTTPJSONWithHeaders(t, client, method, url, payload, uid, email, expectedStatus, nil)
+}
+
+func mustHTTPJSONWithHeaders(
+	t *testing.T,
+	client *http.Client,
+	method string,
+	url string,
+	payload map[string]any,
+	uid string,
+	email string,
+	expectedStatus int,
+	extraHeaders map[string]string,
 ) map[string]any {
 	t.Helper()
 
@@ -302,6 +395,9 @@ func mustHTTPJSON(
 	}
 	if email != "" {
 		req.Header.Set("X-Test-Email", email)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := client.Do(req)

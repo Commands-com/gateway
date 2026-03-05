@@ -45,6 +45,11 @@ type Config struct {
 	IngressGlobalLimitPerWindow int
 	IngressIPLimitPerWindow     int
 	IngressRouteLimitPerWindow  int
+	IdempotencyTTLSeconds       int
+
+	RequireEncryptedFrames bool
+	TransportTokenSecret   string
+	TransportTokenTTL      time.Duration
 
 	FirebaseProjectID       string
 	FirebaseCredentialsPath string
@@ -86,6 +91,11 @@ func Load() (*Config, error) {
 		IngressGlobalLimitPerWindow: intFromEnv("INGRESS_GLOBAL_LIMIT_PER_WINDOW", 3000, 1, 1000000),
 		IngressIPLimitPerWindow:     intFromEnv("INGRESS_IP_LIMIT_PER_WINDOW", 600, 1, 100000),
 		IngressRouteLimitPerWindow:  intFromEnv("INGRESS_ROUTE_LIMIT_PER_WINDOW", 300, 1, 100000),
+		IdempotencyTTLSeconds:       intFromEnv("IDEMPOTENCY_TTL_SECONDS", 300, 30, 86400),
+
+		RequireEncryptedFrames: envBool("REQUIRE_ENCRYPTED_FRAMES", true),
+		TransportTokenSecret:   strings.TrimSpace(os.Getenv("TRANSPORT_TOKEN_SECRET")),
+		TransportTokenTTL:      durationFromSeconds("TRANSPORT_TOKEN_TTL_SECONDS", 3600),
 
 		FirebaseProjectID:       strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID")),
 		FirebaseCredentialsPath: strings.TrimSpace(os.Getenv("FIREBASE_CREDENTIALS_PATH")),
@@ -96,6 +106,9 @@ func Load() (*Config, error) {
 
 	if len(cfg.OAuthRedirectURIs) == 0 {
 		cfg.OAuthRedirectURIs = append([]string(nil), cfg.RedirectAllowlist...)
+	}
+	if cfg.TransportTokenSecret == "" {
+		cfg.TransportTokenSecret = cfg.JWTSigningKey
 	}
 
 	if cfg.PublicBaseURL == "" {
@@ -133,6 +146,12 @@ func (c *Config) Validate() error {
 	}
 	if c.IngressGlobalLimitPerWindow <= 0 || c.IngressIPLimitPerWindow <= 0 || c.IngressRouteLimitPerWindow <= 0 {
 		return fmt.Errorf("ingress rate limits must be > 0")
+	}
+	if c.IdempotencyTTLSeconds <= 0 {
+		return fmt.Errorf("IDEMPOTENCY_TTL_SECONDS must be > 0")
+	}
+	if c.TransportTokenTTL <= 0 {
+		return fmt.Errorf("TRANSPORT_TOKEN_TTL_SECONDS must be > 0")
 	}
 
 	c.OAuthDefaultClientID = strings.TrimSpace(c.OAuthDefaultClientID)

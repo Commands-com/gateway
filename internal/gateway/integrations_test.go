@@ -22,7 +22,8 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 	})
 	app := newGatewayIntegrationTestApp(h)
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -95,7 +96,8 @@ func TestIngressRejectsTokenMismatch(t *testing.T) {
 	})
 	app := newGatewayIntegrationTestApp(h)
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -136,7 +138,8 @@ func TestWebSocketUpgradeMiddlewareForAgentAndTunnel(t *testing.T) {
 	})
 	app := newGatewayIntegrationTestApp(h)
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": "owner-key"}, "owner1", "owner@example.com", fiber.StatusOK)
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
 
 	reqForbidden := httptest.NewRequest("GET", "/gateway/v1/agent/connect?device_id=devowner1", nil)
 	reqForbidden.Header.Set("X-Test-UID", "other-user")

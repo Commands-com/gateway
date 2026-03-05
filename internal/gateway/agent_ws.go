@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"oss-commands-gateway/internal/auth"
+	"oss-commands-gateway/internal/gatewaycrypto"
 )
 
 const maxAgentConnectionsPerOwner = 50
@@ -165,6 +167,21 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 		"device_id": deviceID,
 		"at":        now.Format(time.RFC3339),
 	})
+	if h.transportTokenIssuer != nil {
+		transportToken := h.transportTokenIssuer.IssueToken(deviceID, connID, h.transportTokenTTL)
+		if err := state.writeJSON(map[string]any{
+			"type":            "transport.init",
+			"device_id":       deviceID,
+			"connection_id":   connID,
+			"transport_token": transportToken,
+			"expires_in":      int(h.transportTokenTTL / time.Second),
+			"at":              now.Format(time.RFC3339),
+		}); err != nil {
+			_ = c.Close()
+			return
+		}
+	}
+	h.flushPendingHandshakes(deviceID)
 
 	for {
 		messageType, payload, err := c.ReadMessage()
@@ -212,12 +229,21 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 		return
 	}
 
+	if violation := h.validateAndAdvanceTransportFrame(deviceID, connState, frame); violation != "" {
+		log.Printf("[gateway] transport_rejected device=%s conn=%s violation=%s", deviceID, connState.connID, violation)
+		return
+	}
+	delete(frame, "transport_token")
+	delete(frame, "t_seq")
+	delete(frame, "connection_id")
+
 	sessionID := strings.TrimSpace(firstStringMap(frame, "session_id", "sessionId"))
 	handshakeID := strings.TrimSpace(firstStringMap(frame, "handshake_id", "handshakeId"))
 	if sessionID == "" {
 		return
 	}
-	if !h.isSessionBoundToDevice(sessionID, handshakeID, deviceID) {
+
+	if frameType != "session.handshake.ack" && !h.hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID) {
 		_ = connState.writeJSON(map[string]any{
 			"type":         "agent.error",
 			"error":        "unauthorized_session_frame",
@@ -228,28 +254,167 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 	}
 
 	if frameType == "session.handshake.ack" {
-		now := time.Now().UTC().Unix()
+		if !h.processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID, frame) {
+			return
+		}
+	}
+
+	if encryptedSessionFrameTypes[frameType] {
 		h.mu.RLock()
 		state, ok := h.sessions[sessionID]
 		h.mu.RUnlock()
-		if ok {
-			state.mu.Lock()
-			if state.DeviceID == deviceID && (handshakeID == "" || state.HandshakeID == handshakeID) {
-				if strings.TrimSpace(firstStringMap(frame, "status")) == "error" {
-					state.Status = "agent_error"
-				} else {
-					state.Status = "agent_acknowledged"
-				}
-				state.UpdatedAt = now
+		if !ok {
+			return
+		}
+
+		nowUnix := time.Now().UTC().Unix()
+		state.mu.Lock()
+		if state.DeviceID != deviceID || state.Status != "agent_acknowledged" {
+			state.mu.Unlock()
+			return
+		}
+		if handshakeID != "" && state.HandshakeID != handshakeID {
+			state.mu.Unlock()
+			return
+		}
+		if state.ConversationID != "" {
+			frame["conversation_id"] = state.ConversationID
+		}
+		if violation := validateEncryptedEnvelope(frame); violation != "" {
+			state.UpdatedAt = nowUnix
+			state.mu.Unlock()
+			log.Printf("[gateway] encryption_violation dir=agent_to_client device=%s session=%s frame=%s violation=%s", deviceID, sessionID, frameType, violation)
+			if h.cfg.RequireEncryptedFrames {
+				return
 			}
+		} else {
+			seq, _ := extractPositiveInt(frame, "seq")
+			if seq <= state.SeqAgentToClient {
+				state.mu.Unlock()
+				log.Printf("[gateway] replay_rejected dir=agent_to_client device=%s session=%s frame=%s seq=%d", deviceID, sessionID, frameType, seq)
+				return
+			}
+			state.SeqAgentToClient = seq
+			state.UpdatedAt = nowUnix
 			state.mu.Unlock()
 		}
 	}
 
-	h.appendSessionEvent(sessionID, payload)
+	if strings.TrimSpace(firstStringMap(frame, "conversation_id", "conversationId")) == "" {
+		h.mu.RLock()
+		state, ok := h.sessions[sessionID]
+		h.mu.RUnlock()
+		if ok {
+			state.mu.RLock()
+			if state.ConversationID != "" {
+				frame["conversation_id"] = state.ConversationID
+			}
+			state.mu.RUnlock()
+		}
+	}
+
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		return
+	}
+	h.appendSessionEvent(sessionID, raw)
 }
 
-func (h *Handler) isSessionBoundToDevice(sessionID, handshakeID, deviceID string) bool {
+func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID string, frame map[string]any) bool {
+	h.mu.RLock()
+	state, found := h.sessions[sessionID]
+	device, hasDevice := h.devices[deviceID]
+	h.mu.RUnlock()
+	if !found {
+		return false
+	}
+
+	nowUnix := time.Now().UTC().Unix()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.DeviceID != deviceID {
+		return false
+	}
+	if handshakeID != "" && state.HandshakeID != handshakeID {
+		return false
+	}
+	if state.HandshakeID != "" {
+		frame["handshake_id"] = state.HandshakeID
+	}
+	if state.ConversationID != "" {
+		frame["conversation_id"] = state.ConversationID
+	}
+	frame["session_id"] = state.SessionID
+	frame["device_id"] = state.DeviceID
+
+	if strings.TrimSpace(firstStringMap(frame, "status")) == "error" {
+		lastErr := strings.TrimSpace(firstStringMap(frame, "error", "details", "message"))
+		if lastErr == "" {
+			lastErr = "agent handshake error"
+		}
+		state.Status = "agent_error"
+		state.LastError = lastErr
+		state.UpdatedAt = nowUnix
+		frame["status"] = "agent_error"
+		frame["error"] = lastErr
+		return true
+	}
+
+	agentEphemeral := strings.TrimSpace(firstStringMap(frame, "agent_ephemeral_public_key", "agentEphemeralPublicKey"))
+	agentSignature := strings.TrimSpace(firstStringMap(frame, "agent_identity_signature", "agentIdentitySignature"))
+	transcriptHash := strings.TrimSpace(firstStringMap(frame, "transcript_hash", "transcriptHash"))
+
+	lastErr := ""
+	switch {
+	case agentEphemeral == "" || agentSignature == "" || transcriptHash == "":
+		lastErr = "missing handshake ack fields from agent websocket frame"
+	case state.ClientEphemeralPublicKey == "" || state.ClientSessionNonce == "":
+		lastErr = "client handshake fields missing on gateway state"
+	case !hasDevice || strings.TrimSpace(device.IdentityKey) == "":
+		lastErr = "device identity not found"
+	default:
+		if err := gatewaycrypto.ValidateX25519PublicKey(agentEphemeral); err != nil {
+			lastErr = err.Error()
+		} else {
+			expectedTranscript := gatewaycrypto.BuildTranscriptHash(
+				state.SessionID,
+				state.HandshakeID,
+				state.ClientEphemeralPublicKey,
+				state.ClientSessionNonce,
+				agentEphemeral,
+			)
+			if !gatewaycrypto.ConstantTimeEqualBase64(expectedTranscript, transcriptHash) {
+				lastErr = "transcript hash mismatch"
+			} else if err := gatewaycrypto.VerifyAgentSignature(device.IdentityKey, transcriptHash, agentSignature); err != nil {
+				lastErr = fmt.Sprintf("signature verification failed: %v", err)
+			}
+		}
+	}
+
+	if lastErr != "" {
+		state.Status = "agent_error"
+		state.LastError = lastErr
+		state.UpdatedAt = nowUnix
+		frame["status"] = "agent_error"
+		frame["error"] = lastErr
+		return true
+	}
+
+	state.AgentEphemeralPublicKey = agentEphemeral
+	state.AgentIdentitySignature = agentSignature
+	state.TranscriptHash = transcriptHash
+	state.Status = "agent_acknowledged"
+	state.LastError = ""
+	state.UpdatedAt = nowUnix
+
+	frame["status"] = "agent_acknowledged"
+	frame["agent_ephemeral_public_key"] = agentEphemeral
+	frame["agent_identity_signature"] = agentSignature
+	frame["transcript_hash"] = transcriptHash
+	return true
+}
+
+func (h *Handler) hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID string) bool {
 	h.mu.RLock()
 	state, ok := h.sessions[sessionID]
 	h.mu.RUnlock()
@@ -264,15 +429,64 @@ func (h *Handler) isSessionBoundToDevice(sessionID, handshakeID, deviceID string
 	if handshakeID != "" && state.HandshakeID != handshakeID {
 		return false
 	}
-	return true
+	return state.Status == "agent_acknowledged"
 }
 
-func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any) {
+func (h *Handler) flushPendingHandshakes(deviceID string) {
+	type pendingHandshake struct {
+		sessionID string
+	}
+	pending := make([]pendingHandshake, 0)
+
+	h.mu.RLock()
+	for sessionID, state := range h.sessions {
+		if state == nil {
+			continue
+		}
+		state.mu.RLock()
+		match := state.DeviceID == deviceID && (state.Status == "pending_agent_ack" || state.Status == "pending_agent_connection")
+		state.mu.RUnlock()
+		if match {
+			pending = append(pending, pendingHandshake{sessionID: sessionID})
+		}
+	}
+	h.mu.RUnlock()
+
+	for _, p := range pending {
+		h.mu.RLock()
+		state, ok := h.sessions[p.sessionID]
+		h.mu.RUnlock()
+		if !ok || state == nil {
+			continue
+		}
+		state.mu.RLock()
+		frame := h.buildHandshakeRequestFrame(state)
+		state.mu.RUnlock()
+		if frame == nil {
+			continue
+		}
+
+		newStatus := "pending_agent_ack"
+		newError := ""
+		if err := h.sendToAgentForSession(p.sessionID, frame); err != nil {
+			newStatus = "pending_agent_connection"
+			newError = err.Error()
+		}
+
+		state.mu.Lock()
+		state.Status = newStatus
+		state.LastError = newError
+		state.UpdatedAt = time.Now().UTC().Unix()
+		state.mu.Unlock()
+	}
+}
+
+func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any) error {
 	h.mu.RLock()
 	state, found := h.sessions[sessionID]
 	h.mu.RUnlock()
 	if !found {
-		return
+		return fmt.Errorf("session_not_found")
 	}
 	state.mu.RLock()
 	deviceID := state.DeviceID
@@ -282,7 +496,7 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 	conn := h.agents[deviceID]
 	h.mu.RUnlock()
 	if conn == nil {
-		return
+		return fmt.Errorf("agent_not_connected")
 	}
 
 	writeFn := h.agentWriteFn
@@ -291,5 +505,13 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 			return ac.writeJSON(frame)
 		}
 	}
-	_ = writeFn(conn, payload)
+	if err := writeFn(conn, payload); err != nil {
+		h.mu.Lock()
+		if current, ok := h.agents[deviceID]; ok && current == conn {
+			delete(h.agents, deviceID)
+		}
+		h.mu.Unlock()
+		return fmt.Errorf("agent_unavailable")
+	}
+	return nil
 }

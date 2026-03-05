@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"strings"
 	"sync"
+	"time"
 
 	"oss-commands-gateway/internal/config"
 )
@@ -32,6 +34,12 @@ type Handler struct {
 	tunnelConns              map[string]*tunnelConn
 	activeRoutes             map[string]string
 	inflightRequests         map[string]*inflightRequest
+
+	idempotencyMu   sync.Mutex
+	idempotencyKeys map[string]time.Time
+
+	transportTokenIssuer *TransportTokenIssuer
+	transportTokenTTL    time.Duration
 
 	agentWriteFn  func(*agentConn, map[string]any) error
 	tunnelWriteFn func(*tunnelConn, map[string]any) error
@@ -72,9 +80,20 @@ type sessionState struct {
 	DeviceID       string
 	OwnerUID       string
 	ConversationID string
-	Status         string
-	Members        map[string]struct{}
-	UpdatedAt      int64
+
+	CreatedAt int64
+
+	ClientEphemeralPublicKey string
+	ClientSessionNonce       string
+	AgentEphemeralPublicKey  string
+	AgentIdentitySignature   string
+	TranscriptHash           string
+	LastError                string
+	SeqClientToAgent         int
+	SeqAgentToClient         int
+	Status                   string
+	Members                  map[string]struct{}
+	UpdatedAt                int64
 }
 
 type sessionEvent struct {
@@ -98,11 +117,16 @@ type acceptShareInviteRequest struct {
 	DeviceID string `json:"deviceId"`
 }
 
-type postHandshakeClientInitRequest struct {
-	DeviceID string `json:"deviceId"`
-}
-
 func NewHandler(cfg *config.Config) *Handler {
+	transportTokenTTL := cfg.TransportTokenTTL
+	if transportTokenTTL <= 0 {
+		transportTokenTTL = time.Hour
+	}
+	var transportTokenIssuer *TransportTokenIssuer
+	if strings.TrimSpace(cfg.TransportTokenSecret) != "" {
+		transportTokenIssuer = NewTransportTokenIssuer(cfg.TransportTokenSecret)
+	}
+
 	h := &Handler{
 		cfg:                      cfg,
 		devices:                  make(map[string]deviceRecord),
@@ -117,6 +141,9 @@ func NewHandler(cfg *config.Config) *Handler {
 		tunnelConns:              make(map[string]*tunnelConn),
 		activeRoutes:             make(map[string]string),
 		inflightRequests:         make(map[string]*inflightRequest),
+		idempotencyKeys:          make(map[string]time.Time),
+		transportTokenIssuer:     transportTokenIssuer,
+		transportTokenTTL:        transportTokenTTL,
 	}
 	h.agentWriteFn = func(ac *agentConn, payload map[string]any) error {
 		return ac.writeJSON(payload)
@@ -125,5 +152,6 @@ func NewHandler(cfg *config.Config) *Handler {
 		return tc.writeJSON(payload)
 	}
 	h.startInflightSweeper()
+	h.startIdempotencySweeper()
 	return h
 }

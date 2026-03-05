@@ -33,6 +33,11 @@
 5. Verify reconnect behavior:
    - agent websocket replacement on same `device_id`.
    - tunnel websocket replacement on same `device_id`.
+6. Verify relay security behavior:
+   - `POST /gateway/v1/sessions/:session_id/messages` rejects missing `X-Idempotency-Key`.
+   - encrypted envelope violations are rejected when `REQUIRE_ENCRYPTED_FRAMES=true`.
+   - duplicate/replayed `seq` is rejected for both directions.
+   - when transport token is enabled, outbound agent frames without valid `transport_token`/`t_seq` are dropped.
 
 ## Release notes minimum template
 
