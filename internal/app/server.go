@@ -13,6 +13,7 @@ import (
 
 	"oss-commands-gateway/internal/auth"
 	"oss-commands-gateway/internal/config"
+	"oss-commands-gateway/internal/console"
 	"oss-commands-gateway/internal/gateway"
 	"oss-commands-gateway/internal/health"
 	"oss-commands-gateway/internal/idtoken"
@@ -99,6 +100,7 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 			"auth_mode":     cfg.AuthMode,
 			"state_backend": cfg.StateBackend,
 			"endpoints": fiber.Map{
+				"console":            "/console",
 				"healthz":            "/healthz",
 				"readyz":             "/readyz",
 				"oauth":              "/oauth",
@@ -112,6 +114,8 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	app.Get("/health", healthHandler.Liveness)
 	app.Get("/healthz", healthHandler.Liveness)
 	app.Get("/readyz", healthHandler.Readiness)
+
+	app.Get("/console", console.Handler)
 
 	app.Get("/.well-known/openid-configuration", oauthHandler.WellKnown)
 	app.Get("/.well-known/oauth-authorization-server", oauthHandler.WellKnown)

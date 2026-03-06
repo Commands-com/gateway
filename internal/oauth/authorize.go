@@ -94,9 +94,9 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.Identity, bool, error) {
 	switch h.cfg.AuthMode {
 	case config.AuthModeDemo:
-		uid := strings.TrimSpace(c.FormValue("demo_uid"))
-		email := strings.TrimSpace(c.FormValue("demo_email"))
-		name := strings.TrimSpace(c.FormValue("demo_name"))
+		uid := strings.Clone(strings.TrimSpace(c.FormValue("demo_uid")))
+		email := strings.Clone(strings.TrimSpace(c.FormValue("demo_email")))
+		name := strings.Clone(strings.TrimSpace(c.FormValue("demo_name")))
 		if uid == "" && email == "" && name == "" && c.Method() == fiber.MethodGet {
 			_ = c.Type("html")
 			return nil, true, c.SendString(renderDemoLogin(req))
@@ -114,11 +114,11 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 		}
 		return &idtoken.Identity{UID: uid, Email: email, DisplayName: name}, false, nil
 	case config.AuthModeFirebase, config.AuthModeOIDC:
-		rawIDToken := firstNonEmpty(
+		rawIDToken := strings.Clone(firstNonEmpty(
 			httputil.BearerToken(c.Get("Authorization")),
 			strings.TrimSpace(c.FormValue("id_token")),
 			strings.TrimSpace(c.FormValue("firebase_token")),
-		)
+		))
 		if rawIDToken == "" && c.Method() == fiber.MethodGet {
 			_ = c.Type("html")
 			return nil, true, c.SendString(renderIDTokenForm(req, string(h.cfg.AuthMode)))
@@ -146,11 +146,14 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 }
 
 func parseAuthorizeRequest(c fiber.Ctx) authorizeRequest {
+	// Clone strings: Fiber/fasthttp returns values backed by a reusable
+	// request buffer.  Any value stored beyond the handler lifetime (e.g.
+	// in the auth-code record) must be an independent copy.
 	read := func(key string) string {
 		if v := strings.TrimSpace(c.Query(key)); v != "" {
-			return v
+			return strings.Clone(v)
 		}
-		return strings.TrimSpace(c.FormValue(key))
+		return strings.Clone(strings.TrimSpace(c.FormValue(key)))
 	}
 	return authorizeRequest{
 		ResponseType:        read("response_type"),

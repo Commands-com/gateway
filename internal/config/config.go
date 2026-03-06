@@ -133,6 +133,20 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.PublicBaseURL = strings.TrimRight(cfg.PublicBaseURL, "/")
+
+	// Always allow the built-in console as an OAuth redirect target.
+	consoleURI := cfg.PublicBaseURL + "/console"
+	hasConsole := false
+	for _, u := range cfg.RedirectAllowlist {
+		if strings.TrimSpace(u) == consoleURI {
+			hasConsole = true
+			break
+		}
+	}
+	if !hasConsole {
+		cfg.RedirectAllowlist = append(cfg.RedirectAllowlist, consoleURI)
+	}
+
 	if strings.TrimSpace(cfg.NodeID) == "" {
 		host, _ := os.Hostname()
 		host = strings.TrimSpace(host)

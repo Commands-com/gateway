@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Commands Gateway Console</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #232734;
+  --border: #2e3345;
+  --text: #e1e4ed;
+  --text2: #8b91a5;
+  --accent: #6c8cff;
+  --accent2: #4a6adf;
+  --green: #3dd68c;
+  --red: #f06;
+  --orange: #f5a623;
+  --radius: 8px;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+a { color: var(--accent); text-decoration: none; }
+button {
+  background: var(--accent); color: #fff; border: none; padding: 8px 18px;
+  border-radius: var(--radius); cursor: pointer; font-size: 14px; font-weight: 500;
+  transition: background 0.15s;
+}
+button:hover { background: var(--accent2); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+button.secondary:hover { background: var(--border); }
+button.danger { background: var(--red); }
+button.small { padding: 4px 12px; font-size: 12px; }
+input, textarea, select {
+  background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  padding: 8px 12px; border-radius: var(--radius); font-size: 14px; width: 100%;
+  font-family: inherit;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+label { display: block; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
+label input, label textarea { margin-top: 4px; }
+
+/* Layout */
+#login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+.login-card { background: var(--surface); padding: 40px; border-radius: 12px; border: 1px solid var(--border); width: 100%; max-width: 400px; text-align: center; }
+.login-card h1 { font-size: 22px; margin-bottom: 6px; }
+.login-card p { color: var(--text2); font-size: 14px; margin-bottom: 24px; }
+.login-card .error { color: var(--red); font-size: 13px; margin-top: 12px; }
+
+#app-screen { display: none; }
+header {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 0 24px; height: 52px; display: flex; align-items: center; justify-content: space-between;
+}
+header h1 { font-size: 16px; font-weight: 600; }
+header .user-info { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text2); }
+nav {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 0 24px; display: flex; gap: 0;
+}
+nav button {
+  background: none; color: var(--text2); border: none; border-bottom: 2px solid transparent;
+  padding: 12px 20px; border-radius: 0; font-size: 14px; font-weight: 500;
+}
+nav button:hover { color: var(--text); background: none; }
+nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+section { display: none; }
+section.active { display: block; }
+
+/* Cards & Stats */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px;
+}
+.stat-card .label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px; margin-bottom: 16px;
+}
+.card h3 { font-size: 15px; margin-bottom: 12px; }
+
+/* Device list */
+.device-list { display: grid; gap: 12px; }
+.device-item {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px; display: flex; align-items: center; justify-content: space-between;
+  cursor: pointer; transition: border-color 0.15s;
+}
+.device-item:hover { border-color: var(--accent); }
+.device-item .left { display: flex; align-items: center; gap: 12px; }
+.device-item .status-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--text2); flex-shrink: 0;
+}
+.device-item .status-dot.online { background: var(--green); }
+.device-item .name { font-weight: 600; font-size: 15px; }
+.device-item .meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.device-item .actions { display: flex; gap: 8px; }
+
+/* Session chat */
+.session-container { display: grid; grid-template-columns: 280px 1fr; gap: 20px; min-height: 500px; }
+.session-list {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow-y: auto;
+}
+.session-list-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px; }
+.session-list-item {
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  cursor: pointer; font-size: 13px; transition: background 0.1s;
+}
+.session-list-item:hover { background: var(--surface2); }
+.session-list-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
+.session-list-item .sess-device { font-weight: 600; }
+.session-list-item .sess-status { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.chat-panel {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  display: flex; flex-direction: column;
+}
+.chat-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px; }
+.chat-header .status-badge {
+  display: inline-block; font-size: 11px; font-weight: 500; padding: 2px 8px;
+  border-radius: 10px; margin-left: 8px; background: var(--surface2); color: var(--text2);
+}
+.chat-header .status-badge.ack { background: rgba(61,214,140,0.15); color: var(--green); }
+.chat-header .status-badge.pending { background: rgba(245,166,35,0.15); color: var(--orange); }
+.chat-messages {
+  flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px;
+  min-height: 300px; max-height: 60vh; font-family: var(--mono); font-size: 13px;
+}
+.msg { padding: 8px 12px; border-radius: var(--radius); max-width: 85%; word-break: break-word; }
+.msg.sent { background: var(--accent2); align-self: flex-end; }
+.msg.received { background: var(--surface2); align-self: flex-start; }
+.msg.system { background: none; color: var(--text2); font-size: 12px; align-self: center; text-align: center; }
+.msg .ts { font-size: 10px; color: rgba(255,255,255,0.5); margin-top: 4px; }
+.chat-input {
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px;
+}
+.chat-input textarea { resize: none; height: 38px; font-family: var(--mono); font-size: 13px; }
+.chat-input button { flex-shrink: 0; }
+
+/* Shares */
+.grant-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 14px;
+}
+.grant-row:last-child { border-bottom: none; }
+.badge {
+  display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+  border-radius: 10px; text-transform: uppercase;
+}
+.badge.active { background: rgba(61,214,140,0.15); color: var(--green); }
+.badge.pending { background: rgba(245,166,35,0.15); color: var(--orange); }
+.badge.revoked { background: rgba(255,0,102,0.12); color: var(--red); }
+.badge.expired { background: var(--surface2); color: var(--text2); }
+
+/* Modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
+  align-items: center; justify-content: center; z-index: 100;
+}
+.modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; width: 100%; max-width: 440px;
+}
+.modal h2 { font-size: 18px; margin-bottom: 16px; }
+.modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+/* Misc */
+.empty { text-align: center; padding: 40px; color: var(--text2); }
+.loading { text-align: center; padding: 20px; color: var(--text2); }
+.inline-flex { display: flex; align-items: center; gap: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.toolbar h2 { font-size: 18px; font-weight: 600; }
+code { font-family: var(--mono); font-size: 13px; background: var(--surface2); padding: 2px 6px; border-radius: 4px; }
+@media (max-width: 768px) {
+  .session-container { grid-template-columns: 1fr; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>Commands Gateway</h1>
+    <p>Sign in to access the console</p>
+    <button id="login-btn" onclick="Auth.startLogin()">Sign In</button>
+    <div class="error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- App Screen -->
+<div id="app-screen">
+  <header>
+    <h1>Commands Gateway Console</h1>
+    <div class="user-info">
+      <span id="user-display"></span>
+      <button class="secondary small" onclick="Auth.logout()">Sign Out</button>
+    </div>
+  </header>
+  <nav>
+    <button class="active" data-tab="dashboard">Dashboard</button>
+    <button data-tab="devices">Devices</button>
+    <button data-tab="sessions">Sessions</button>
+    <button data-tab="shares">Shares</button>
+  </nav>
+  <main>
+    <section id="tab-dashboard" class="active">
+      <div class="toolbar"><h2>Dashboard</h2><button class="secondary small" onclick="Dashboard.refresh()">Refresh</button></div>
+      <div class="stats-grid" id="stats-grid"></div>
+      <div class="card"><h3>Configuration</h3><div id="config-info"></div></div>
+    </section>
+
+    <section id="tab-devices">
+      <div class="toolbar"><h2>Devices</h2><div id="devices-sse-status" style="font-size:12px;color:var(--text2)"></div></div>
+      <div id="device-list" class="device-list"><div class="loading">Loading devices...</div></div>
+    </section>
+
+    <section id="tab-sessions">
+      <div class="toolbar">
+        <h2>Sessions</h2>
+        <button class="small" onclick="Sessions.showNewDialog()">New Session</button>
+      </div>
+      <div class="session-container">
+        <div class="session-list">
+          <div class="session-list-header">Sessions</div>
+          <div id="session-list-items"><div class="empty" style="padding:20px">No sessions yet</div></div>
+        </div>
+        <div class="chat-panel" id="chat-panel">
+          <div class="chat-header" id="chat-header">Select a session</div>
+          <div class="chat-messages" id="chat-messages"><div class="empty">Select or create a session to begin</div></div>
+          <div class="chat-input" id="chat-input" style="display:none">
+            <textarea id="msg-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();Sessions.send()}"></textarea>
+            <button onclick="Sessions.send()">Send</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-shares">
+      <div class="toolbar">
+        <h2>Shares</h2>
+        <button class="small" onclick="Shares.showInviteDialog()">Create Invite</button>
+      </div>
+      <div id="shares-content"><div class="loading">Loading...</div></div>
+    </section>
+  </main>
+</div>
+
+<!-- Modal container -->
+<div id="modal-root"></div>
+
+<script>
+'use strict';
+console.log('[console] build 2026-03-06b');
+
+// ========== Config ==========
+const BASE = location.origin;
+const GW = BASE + '/gateway/v1';
+const OAUTH = BASE + '/oauth';
+const CONSOLE_URL = BASE + '/console';
+const STORAGE_KEY = 'gw_console_auth';
+const PKCE_KEY = 'gw_console_pkce';
+
+// ========== Utilities ==========
+function $(sel) { return document.querySelector(sel); }
+function $$(sel) { return document.querySelectorAll(sel); }
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function genId(prefix) { return prefix + '_' + crypto.randomUUID().replace(/-/g, ''); }
+
+function b64encode(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+function b64decode(s) {
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function b64url(buf) {
+  return b64encode(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function sha256b64url(str) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return b64url(hash);
+}
+
+function randomString(len) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const arr = crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(arr, b => chars[b % chars.length]).join('');
+}
+
+function timeAgo(iso) {
+  if (!iso) return '';
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
+function showModal(html) {
+  $('#modal-root').innerHTML = `<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal">${html}</div></div>`;
+}
+function closeModal() { $('#modal-root').innerHTML = ''; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ========== Auth (redirect-based OAuth + PKCE) ==========
+const Auth = {
+  tokens: null,
+
+  async init() {
+    // 1. Check for OAuth callback (?code=...)
+    const params = new URLSearchParams(location.search);
+    const code = params.get('code');
+    if (code) {
+      history.replaceState(null, '', CONSOLE_URL);
+      const ok = await this.exchangeCode(code);
+      if (ok) { this.showApp(); return; }
+    }
+
+    // 2. Check for saved tokens
+    const saved = sessionStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      try {
+        this.tokens = JSON.parse(saved);
+        if (this.tokens.access_token) {
+          this.showApp();
+          return;
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // 3. Show login screen
+    this.showLogin();
+  },
+
+  showLogin() {
+    $('#login-screen').style.display = '';
+    $('#app-screen').style.display = 'none';
+  },
+
+  async startLogin() {
+    // Generate PKCE verifier and S256 challenge
+    const verifier = randomString(64);
+    const challenge = await sha256b64url(verifier);
+
+    // Save verifier for the callback
+    sessionStorage.setItem(PKCE_KEY, verifier);
+
+    // Redirect to OAuth authorize endpoint (shows gateway's own login page)
+    const params = new URLSearchParams({
+      response_type: 'code',
+      redirect_uri: CONSOLE_URL,
+      scope: 'openid profile email device',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    });
+    location.href = OAUTH + '/authorize?' + params.toString();
+  },
+
+  async exchangeCode(code) {
+    const verifier = sessionStorage.getItem(PKCE_KEY);
+    sessionStorage.removeItem(PKCE_KEY);
+    if (!verifier) {
+      $('#login-error').textContent = 'Missing PKCE verifier. Please sign in again.';
+      return false;
+    }
+
+    try {
+      const params = new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        code_verifier: verifier,
+        redirect_uri: CONSOLE_URL,
+      });
+      const r = await fetch(OAUTH + '/token', {
+        method: 'POST',
+        body: params,
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        $('#login-error').textContent = err.error_description || err.error || 'Token exchange failed';
+        return false;
+      }
+      this.tokens = await r.json();
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(this.tokens));
+      return true;
+    } catch (e) {
+      $('#login-error').textContent = 'Token exchange failed: ' + e.message;
+      return false;
+    }
+  },
+
+  async refreshAccessToken() {
+    if (!this.tokens || !this.tokens.refresh_token) {
+      this.logout();
+      return false;
+    }
+    try {
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: this.tokens.refresh_token,
+      });
+      const r = await fetch(OAUTH + '/token', { method: 'POST', body: params });
+      if (!r.ok) { this.logout(); return false; }
+      const data = await r.json();
+      this.tokens.access_token = data.access_token;
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(this.tokens));
+      return true;
+    } catch (e) { this.logout(); return false; }
+  },
+
+  headers() {
+    return { 'Authorization': 'Bearer ' + (this.tokens?.access_token || ''), 'Content-Type': 'application/json' };
+  },
+
+  async apiFetch(url, opts = {}) {
+    opts.headers = { ...this.headers(), ...opts.headers };
+    let r = await fetch(url, opts);
+    if (r.status === 401 && await this.refreshAccessToken()) {
+      opts.headers.Authorization = 'Bearer ' + this.tokens.access_token;
+      r = await fetch(url, opts);
+    }
+    return r;
+  },
+
+  showApp() {
+    $('#login-screen').style.display = 'none';
+    $('#app-screen').style.display = 'block';
+    const payload = this.tokens?.access_token?.split('.')[1];
+    if (payload) {
+      try {
+        const claims = JSON.parse(atob(payload));
+        $('#user-display').textContent = claims.email || claims.display_name || claims.sub || '';
+      } catch (e) { $('#user-display').textContent = ''; }
+    }
+    App.init();
+  },
+
+  logout() {
+    this.tokens = null;
+    sessionStorage.removeItem(STORAGE_KEY);
+    sessionStorage.removeItem(PKCE_KEY);
+    Devices.stopSSE();
+    Sessions.cleanup();
+    location.href = CONSOLE_URL;
+  }
+};
+
+// ========== API helper ==========
+async function api(path, opts) {
+  return Auth.apiFetch(GW + path, opts);
+}
+
+// ========== Dashboard ==========
+const Dashboard = {
+  async refresh() {
+    try {
+      const r = await api('/health');
+      const data = await r.json();
+      const stats = [
+        { label: 'Devices', value: data.devices ?? '-' },
+        { label: 'Agents Online', value: data.agents ?? '-' },
+        { label: 'Sessions', value: data.sessions ?? '-' },
+        { label: 'Routes', value: data.routes ?? '-' },
+        { label: 'Tunnels', value: data.tunnels ?? '-' },
+        { label: 'Inflight', value: data.inflight ?? '-' },
+        { label: 'Grants', value: data.grants ?? '-' },
+        { label: 'Event Backlogs', value: data.event_backlogs ?? '-' },
+      ];
+      $('#stats-grid').innerHTML = stats.map(s =>
+        `<div class="stat-card"><div class="label">${esc(s.label)}</div><div class="value">${esc(String(s.value))}</div></div>`
+      ).join('');
+
+      $('#config-info').innerHTML = `<div style="font-size:14px;display:grid;gap:6px">
+        <div><span style="color:var(--text2)">Status:</span> <span style="color:var(--green)">${esc(data.status || 'ok')}</span></div>
+        <div><span style="color:var(--text2)">State Backend:</span> <code>${esc(data.state_backend || '-')}</code></div>
+      </div>`;
+    } catch (e) {
+      $('#stats-grid').innerHTML = `<div class="empty">Failed to load stats</div>`;
+    }
+  }
+};
+
+// ========== Devices ==========
+const Devices = {
+  items: [],
+
+  async load() {
+    try {
+      const r = await api('/devices');
+      const data = await r.json();
+      this.items = data.devices || [];
+      this.render();
+    } catch (e) {
+      $('#device-list').innerHTML = `<div class="empty">Failed to load devices</div>`;
+    }
+  },
+
+  render() {
+    if (this.items.length === 0) {
+      $('#device-list').innerHTML = `<div class="empty">No devices registered</div>`;
+      return;
+    }
+    $('#device-list').innerHTML = this.items.map(d => `
+      <div class="device-item" onclick="Devices.showDetail('${esc(d.device_id)}')">
+        <div class="left">
+          <div class="status-dot ${d.connected ? 'online' : ''}"></div>
+          <div>
+            <div class="name">${esc(d.display_name || d.device_id)}</div>
+            <div class="meta">${esc(d.device_id)} &middot; ${d.connected ? 'Online' : 'Offline'}${d.last_seen_at ? ' &middot; Seen ' + timeAgo(d.last_seen_at) : ''}${d.role ? ' &middot; ' + esc(d.role) : ''}</div>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="secondary small" onclick="event.stopPropagation();Sessions.createFor('${esc(d.device_id)}')">Session</button>
+        </div>
+      </div>
+    `).join('');
+  },
+
+  startSSE() {
+    this.stopSSE();
+    this._sseActive = true;
+    this._runSSE();
+  },
+
+  async _runSSE() {
+    const statusEl = $('#devices-sse-status');
+    while (this._sseActive) {
+      try {
+        statusEl.textContent = 'Connecting...';
+        const r = await Auth.apiFetch(GW + '/devices/events');
+        if (!r.ok || !r.body) { statusEl.textContent = 'SSE error'; await sleep(5000); continue; }
+        statusEl.textContent = 'Live';
+        statusEl.style.color = 'var(--green)';
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (this._sseActive) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const evt = JSON.parse(line.slice(6));
+                this._handleDeviceEvent(evt);
+              } catch (e) { }
+            }
+          }
+        }
+      } catch (e) {
+        statusEl.textContent = 'Disconnected';
+        statusEl.style.color = 'var(--orange)';
+      }
+      if (this._sseActive) await sleep(3000);
+    }
+  },
+
+  _handleDeviceEvent(evt) {
+    const idx = this.items.findIndex(d => d.device_id === evt.deviceId);
+    if (idx >= 0) {
+      this.items[idx].status = evt.status;
+      this.items[idx].connected = evt.status === 'online';
+      if (evt.at) this.items[idx].last_seen_at = evt.at;
+      this.render();
+    } else {
+      this.load();
+    }
+  },
+
+  stopSSE() {
+    this._sseActive = false;
+  },
+
+  async showDetail(deviceId) {
+    const d = this.items.find(i => i.device_id === deviceId);
+    if (!d) return;
+    showModal(`
+      <h2>${esc(d.display_name || d.device_id)}</h2>
+      <div style="font-size:14px;display:grid;gap:8px;margin-bottom:16px">
+        <div><span style="color:var(--text2)">Device ID:</span> <code>${esc(d.device_id)}</code></div>
+        <div><span style="color:var(--text2)">Status:</span> <span style="color:${d.connected ? 'var(--green)' : 'var(--text2)'}">${d.connected ? 'Online' : 'Offline'}</span></div>
+        <div><span style="color:var(--text2)">Owner:</span> ${esc(d.owner_email || d.owner_uid || '-')}</div>
+        <div><span style="color:var(--text2)">Role:</span> ${esc(d.role || 'owner')}</div>
+        <div><span style="color:var(--text2)">Updated:</span> ${esc(d.updated_at || '-')}</div>
+      </div>
+      <div id="device-key-info"><div class="loading">Loading key...</div></div>
+      <div class="actions">
+        <button class="secondary" onclick="closeModal()">Close</button>
+        <button onclick="closeModal();Sessions.createFor('${esc(d.device_id)}')">New Session</button>
+      </div>
+    `);
+    try {
+      const r = await api('/devices/' + deviceId + '/identity-key');
+      if (r.ok) {
+        const key = await r.json();
+        $('#device-key-info').innerHTML = `
+          <div style="font-size:14px;display:grid;gap:8px">
+            <div><span style="color:var(--text2)">Algorithm:</span> <code>${esc(key.algorithm || '-')}</code></div>
+            <div><span style="color:var(--text2)">Public Key:</span> <code style="word-break:break-all">${esc(key.public_key || '-')}</code></div>
+          </div>`;
+      } else {
+        $('#device-key-info').innerHTML = '<div style="color:var(--text2);font-size:13px">No identity key registered</div>';
+      }
+    } catch (e) {
+      $('#device-key-info').innerHTML = '<div style="color:var(--red);font-size:13px">Failed to load key</div>';
+    }
+  }
+};
+
+// ========== E2E Crypto ==========
+const E2E = {
+  async generateKeyPair() {
+    const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+    const raw = await crypto.subtle.exportKey('raw', kp.publicKey);
+    return { keyPair: kp, publicKeyB64: b64encode(new Uint8Array(raw)) };
+  },
+
+  async buildTranscriptHash(sessionId, handshakeId, clientEphemeralPubB64, clientSessionNonce, agentEphemeralPubB64) {
+    const transcript = `${sessionId}|${handshakeId}|${clientEphemeralPubB64}|${clientSessionNonce}|${agentEphemeralPubB64}`;
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(transcript));
+    return b64encode(new Uint8Array(hash));
+  },
+
+  async deriveSessionKeys(privateKey, agentEphemeralPubB64, transcriptHashB64) {
+    const peerRaw = b64decode(agentEphemeralPubB64);
+    const peerKey = await crypto.subtle.importKey('raw', peerRaw, { name: 'X25519' }, false, []);
+    const sharedSecret = await crypto.subtle.deriveBits({ name: 'X25519', public: peerKey }, privateKey, 256);
+    const hkdfKey = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+    const keyMaterial = await crypto.subtle.deriveBits({
+      name: 'HKDF', hash: 'SHA-256',
+      salt: b64decode(transcriptHashB64),
+      info: new TextEncoder().encode('commands.com/gateway/v1/e2ee'),
+    }, hkdfKey, 768);
+    const bytes = new Uint8Array(keyMaterial);
+    return { clientToAgent: bytes.slice(0, 32), agentToClient: bytes.slice(32, 64), control: bytes.slice(64, 96) };
+  },
+
+  deterministicNonce(direction, seq) {
+    const nonce = new Uint8Array(12);
+    const prefix = direction === 'client_to_agent' ? [0x63, 0x32, 0x61, 0x00] : [0x61, 0x32, 0x63, 0x00];
+    nonce.set(prefix, 0);
+    let value = BigInt(seq);
+    for (let i = 11; i >= 4; i -= 1) { nonce[i] = Number(value & 0xffn); value >>= 8n; }
+    return nonce;
+  },
+
+  buildAad(sessionId, messageId, seq, direction) {
+    const raw = `${sessionId}|${messageId}|${seq}|${direction}`;
+    return b64encode(new TextEncoder().encode(raw));
+  },
+
+  async encrypt(keyBytes, direction, seq, plaintextUtf8, aadBase64) {
+    const nonce = this.deterministicNonce(direction, seq);
+    const aesKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+    const opts = { name: 'AES-GCM', iv: nonce, tagLength: 128 };
+    if (aadBase64) opts.additionalData = b64decode(aadBase64);
+    const encrypted = new Uint8Array(await crypto.subtle.encrypt(opts, aesKey, new TextEncoder().encode(plaintextUtf8)));
+    return {
+      encrypted: true, alg: 'aes-256-gcm', direction, seq,
+      ciphertext: b64encode(encrypted.slice(0, -16)),
+      nonce: b64encode(nonce),
+      tag: b64encode(encrypted.slice(-16)),
+      ...(aadBase64 ? { aad: aadBase64 } : {}),
+    };
+  },
+
+  async decrypt(keyBytes, direction, seq, nonceBase64, ciphertextBase64, tagBase64, aadBase64) {
+    const ciphertext = b64decode(ciphertextBase64);
+    const tag = b64decode(tagBase64);
+    const nonce = b64decode(nonceBase64);
+    const combined = new Uint8Array(ciphertext.length + tag.length);
+    combined.set(ciphertext, 0);
+    combined.set(tag, ciphertext.length);
+    const aesKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+    const opts = { name: 'AES-GCM', iv: nonce, tagLength: 128 };
+    if (aadBase64) opts.additionalData = b64decode(aadBase64);
+    const result = await crypto.subtle.decrypt(opts, aesKey, combined);
+    return new TextDecoder().decode(result);
+  }
+};
+
+// ========== Sessions ==========
+const Sessions = {
+  sessions: {},
+  activeId: null,
+
+  showNewDialog() {
+    const deviceOpts = Devices.items.filter(d => d.connected).map(d =>
+      `<option value="${esc(d.device_id)}">${esc(d.display_name || d.device_id)}</option>`
+    ).join('');
+    showModal(`
+      <h2>New Session</h2>
+      <form onsubmit="return Sessions.create(event)">
+        <label>Device<select id="new-sess-device" required>${deviceOpts || '<option value="">No online devices</option>'}</select></label>
+        <div class="actions">
+          <button class="secondary" type="button" onclick="closeModal()">Cancel</button>
+          <button type="submit" ${deviceOpts ? '' : 'disabled'}>Create</button>
+        </div>
+      </form>
+    `);
+  },
+
+  async create(e) {
+    if (e) e.preventDefault();
+    const deviceId = $('#new-sess-device')?.value;
+    if (!deviceId) return false;
+    closeModal();
+    await this.createFor(deviceId);
+    return false;
+  },
+
+  async createFor(deviceId) {
+    switchTab('sessions');
+    const sessionId = genId('sess');
+    const handshakeId = genId('hs');
+    const nonce = b64encode(crypto.getRandomValues(new Uint8Array(24)));
+
+    let ephemeralPublicKey = '';
+    let cryptoState = null;
+    try {
+      const { keyPair, publicKeyB64 } = await E2E.generateKeyPair();
+      ephemeralPublicKey = publicKeyB64;
+      cryptoState = { keyPair, sessionKeys: null };
+    } catch (e) {
+      ephemeralPublicKey = b64encode(crypto.getRandomValues(new Uint8Array(32)));
+    }
+
+    const sess = {
+      sessionId, handshakeId, deviceId, nonce, ephemeralPublicKey,
+      crypto: cryptoState,
+      state: { status: 'creating', handshake_id: handshakeId, conversation_id: '' },
+      messages: [],
+      outSeq: 0,
+      inSeq: 0,
+      _sseActive: false,
+    };
+    this.sessions[sessionId] = sess;
+    sess.messages.push({ type: 'system', text: 'Creating session with ' + deviceId + '...' });
+    this.switchTo(sessionId);
+    this.renderList();
+
+    try {
+      const r = await api('/sessions/' + sessionId + '/handshake/client-init', {
+        method: 'POST',
+        body: JSON.stringify({
+          device_id: deviceId,
+          handshake_id: handshakeId,
+          client_ephemeral_public_key: ephemeralPublicKey,
+          client_session_nonce: nonce,
+        }),
+      });
+      const data = await r.json();
+      sess.state = data;
+      sess.messages.push({ type: 'system', text: 'Handshake initiated: ' + (data.relay_status || data.status) });
+      this.renderChat();
+      this.renderList();
+      this._startEventStream(sessionId);
+      if (data.status !== 'agent_acknowledged') {
+        this._pollHandshake(sessionId);
+      } else {
+        await this._onHandshakeComplete(sessionId, data);
+      }
+    } catch (e) {
+      sess.messages.push({ type: 'system', text: 'Error: ' + e.message });
+      sess.state.status = 'error';
+      this.renderChat();
+      this.renderList();
+    }
+  },
+
+  async _pollHandshake(sessionId) {
+    const sess = this.sessions[sessionId];
+    if (!sess) return;
+    for (let i = 0; i < 60; i++) {
+      await sleep(2000);
+      if (!this.sessions[sessionId]) return;
+      try {
+        const r = await api('/sessions/' + sessionId + '/handshake/' + sess.handshakeId);
+        if (!r.ok) continue;
+        const data = await r.json();
+        sess.state = { ...sess.state, ...data };
+        this.renderList();
+        if (data.status === 'agent_acknowledged') {
+          await this._onHandshakeComplete(sessionId, data);
+          return;
+        }
+      } catch (e) { }
+    }
+    sess.messages.push({ type: 'system', text: 'Handshake timed out waiting for agent' });
+    this.renderChat();
+  },
+
+  async _onHandshakeComplete(sessionId, data) {
+    const sess = this.sessions[sessionId];
+    if (!sess) return;
+    sess.messages.push({ type: 'system', text: 'Agent acknowledged handshake' });
+    sess.state.status = 'agent_acknowledged';
+    sess.state.conversation_id = data.conversation_id || sess.state.conversation_id;
+    if (sess.crypto && data.agent_ephemeral_public_key) {
+      try {
+        const transcriptHash = await E2E.buildTranscriptHash(
+          sess.sessionId, sess.handshakeId, sess.ephemeralPublicKey,
+          sess.nonce, data.agent_ephemeral_public_key
+        );
+        if (data.transcript_hash && transcriptHash !== data.transcript_hash) {
+          throw new Error('transcript hash mismatch');
+        }
+        sess.crypto.sessionKeys = await E2E.deriveSessionKeys(
+          sess.crypto.keyPair.privateKey, data.agent_ephemeral_public_key, transcriptHash
+        );
+        sess.messages.push({ type: 'system', text: 'E2E encryption established (X25519 + HKDF + AES-GCM)' });
+      } catch (e) {
+        sess.messages.push({ type: 'system', text: 'E2E key derivation failed: ' + e.message });
+        sess.crypto = null;
+      }
+    }
+    this.renderChat();
+    this.renderList();
+  },
+
+  async _startEventStream(sessionId) {
+    const sess = this.sessions[sessionId];
+    if (!sess) return;
+    sess._sseActive = true;
+    while (sess._sseActive && this.sessions[sessionId]) {
+      try {
+        const r = await Auth.apiFetch(GW + '/sessions/' + sessionId + '/events');
+        if (!r.ok || !r.body) { await sleep(3000); continue; }
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (sess._sseActive) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          let eventType = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              try {
+                const evt = JSON.parse(line.slice(6));
+                this._handleSessionEvent(sessionId, eventType, evt);
+              } catch (e) { }
+              eventType = '';
+            }
+          }
+        }
+      } catch (e) { }
+      if (sess._sseActive) await sleep(3000);
+    }
+  },
+
+  async _handleSessionEvent(sessionId, eventType, evt) {
+    const sess = this.sessions[sessionId];
+    if (!sess) return;
+    if (evt.type === 'session.handshake.ack') {
+      if (sess.state.status !== 'agent_acknowledged') {
+        await this._onHandshakeComplete(sessionId, evt);
+      }
+      return;
+    }
+    let text = '';
+    const isEncrypted = evt.encrypted === true;
+    if (isEncrypted && sess.crypto?.sessionKeys) {
+      try {
+        const seq = typeof evt.seq === 'number' ? evt.seq : parseInt(evt.seq, 10);
+        const decrypted = await E2E.decrypt(
+          sess.crypto.sessionKeys.agentToClient, 'agent_to_client', seq,
+          evt.nonce, evt.ciphertext, evt.tag, evt.aad
+        );
+        try { text = JSON.stringify(JSON.parse(decrypted), null, 2); } catch (e) { text = decrypted; }
+      } catch (e) {
+        text = '[Encrypted - decryption failed: ' + e.message + ']\n' + JSON.stringify(evt, null, 2);
+      }
+    } else if (isEncrypted) {
+      text = '[Encrypted payload]\n' + JSON.stringify({ seq: evt.seq, type: evt.type }, null, 2);
+    } else {
+      text = JSON.stringify(evt, null, 2);
+    }
+    const msgType = evt.type || eventType || 'event';
+    sess.messages.push({ type: 'received', text, label: msgType, ts: evt.received_at || new Date().toISOString() });
+    if (this.activeId === sessionId) this.renderChat();
+  },
+
+  async send() {
+    const sess = this.sessions[this.activeId];
+    if (!sess || sess.state.status !== 'agent_acknowledged') return;
+    const input = $('#msg-input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sess.outSeq++;
+    const idempotencyKey = genId('idem');
+    const messageId = genId('msg');
+    let body;
+    if (sess.crypto?.sessionKeys) {
+      try {
+        const seq = sess.outSeq;
+        const aad = E2E.buildAad(sess.sessionId, messageId, seq, 'client_to_agent');
+        const plaintext = JSON.stringify({
+          session_id: sess.sessionId,
+          message_id: messageId,
+          prompt: text,
+        });
+        const frame = await E2E.encrypt(sess.crypto.sessionKeys.clientToAgent, 'client_to_agent', seq, plaintext, aad);
+        body = {
+          ...frame, type: 'session.message',
+          session_id: sess.sessionId, message_id: messageId,
+          handshake_id: sess.handshakeId,
+          ...(sess.state.conversation_id ? { conversation_id: sess.state.conversation_id } : {}),
+        };
+      } catch (e) {
+        sess.messages.push({ type: 'system', text: 'Encryption failed: ' + e.message });
+        this.renderChat();
+        return;
+      }
+    } else {
+      body = { content: text, conversation_id: sess.state.conversation_id };
+    }
+    sess.messages.push({ type: 'sent', text, ts: new Date().toISOString() });
+    this.renderChat();
+    try {
+      const r = await api('/sessions/' + this.activeId + '/messages', {
+        method: 'POST',
+        headers: { 'X-Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        sess.messages.push({ type: 'system', text: 'Send error: ' + (err.error || r.status) });
+        this.renderChat();
+      }
+    } catch (e) {
+      sess.messages.push({ type: 'system', text: 'Send failed: ' + e.message });
+      this.renderChat();
+    }
+  },
+
+  switchTo(sessionId) {
+    this.activeId = sessionId;
+    this.renderList();
+    this.renderChat();
+  },
+
+  renderList() {
+    const ids = Object.keys(this.sessions);
+    if (ids.length === 0) {
+      $('#session-list-items').innerHTML = '<div class="empty" style="padding:20px">No sessions yet</div>';
+      return;
+    }
+    $('#session-list-items').innerHTML = ids.map(id => {
+      const s = this.sessions[id];
+      const active = id === this.activeId ? 'active' : '';
+      const device = Devices.items.find(d => d.device_id === s.deviceId);
+      const name = device?.display_name || s.deviceId;
+      return `<div class="session-list-item ${active}" onclick="Sessions.switchTo('${esc(id)}')">
+        <div class="sess-device">${esc(name)}</div>
+        <div class="sess-status">${esc(s.state.status || 'unknown')}</div>
+      </div>`;
+    }).join('');
+  },
+
+  renderChat() {
+    const sess = this.sessions[this.activeId];
+    if (!sess) {
+      $('#chat-header').innerHTML = 'Select a session';
+      $('#chat-messages').innerHTML = '<div class="empty">Select or create a session to begin</div>';
+      $('#chat-input').style.display = 'none';
+      return;
+    }
+    const statusClass = sess.state.status === 'agent_acknowledged' ? 'ack' : 'pending';
+    const device = Devices.items.find(d => d.device_id === sess.deviceId);
+    const name = device?.display_name || sess.deviceId;
+    const cryptoLabel = sess.crypto?.sessionKeys ? ' (encrypted)' : '';
+    $('#chat-header').innerHTML = `${esc(name)}<span class="status-badge ${statusClass}">${esc(sess.state.status || 'unknown')}${cryptoLabel}</span>`;
+    const msgs = sess.messages.map(m => {
+      if (m.type === 'system') return `<div class="msg system">${esc(m.text)}</div>`;
+      if (m.type === 'sent') return `<div class="msg sent"><div>${esc(m.text)}</div><div class="ts">${timeAgo(m.ts)}</div></div>`;
+      const label = m.label ? `<div style="font-size:11px;color:var(--accent);margin-bottom:4px">${esc(m.label)}</div>` : '';
+      return `<div class="msg received">${label}<pre style="margin:0;white-space:pre-wrap">${esc(m.text)}</pre><div class="ts">${timeAgo(m.ts)}</div></div>`;
+    }).join('');
+    $('#chat-messages').innerHTML = msgs || '<div class="empty">No messages yet</div>';
+    const el = $('#chat-messages');
+    el.scrollTop = el.scrollHeight;
+    $('#chat-input').style.display = sess.state.status === 'agent_acknowledged' ? 'flex' : 'none';
+  },
+
+  cleanup() {
+    for (const id of Object.keys(this.sessions)) {
+      this.sessions[id]._sseActive = false;
+    }
+    this.sessions = {};
+    this.activeId = null;
+  }
+};
+
+// ========== Shares ==========
+const Shares = {
+  async load() {
+    const ownedDevices = Devices.items.filter(d => d.role === 'owner');
+    if (ownedDevices.length === 0) {
+      $('#shares-content').innerHTML = '<div class="empty">No owned devices. Register a device to manage shares.</div>';
+      return;
+    }
+    let html = '';
+    for (const device of ownedDevices) {
+      try {
+        const r = await api('/shares/devices/' + device.device_id + '/grants');
+        if (!r.ok) continue;
+        const data = await r.json();
+        const grants = data.grants || [];
+        html += `<div class="card"><h3>${esc(device.display_name || device.device_id)}</h3>`;
+        if (grants.length === 0) {
+          html += `<div style="color:var(--text2);font-size:14px">No shares</div>`;
+        } else {
+          html += grants.map(g => `
+            <div class="grant-row">
+              <div>
+                <div>${esc(g.granteeEmail || g.granteeUid || 'Pending')}</div>
+                <div style="font-size:12px;color:var(--text2)">${esc(g.role || '')} &middot; Created ${timeAgo(g.createdAt ? new Date(g.createdAt * 1000).toISOString() : '')}</div>
+              </div>
+              <div class="inline-flex">
+                <span class="badge ${g.status}">${esc(g.status)}</span>
+                ${g.status === 'active' || g.status === 'pending' ? `<button class="danger small" onclick="Shares.revoke('${esc(g.grantId)}')">Revoke</button>` : ''}
+              </div>
+            </div>
+          `).join('');
+        }
+        html += `</div>`;
+      } catch (e) { }
+    }
+    $('#shares-content').innerHTML = html || '<div class="empty">No shares found</div>';
+  },
+
+  showInviteDialog() {
+    const owned = Devices.items.filter(d => d.role === 'owner');
+    const opts = owned.map(d => `<option value="${esc(d.device_id)}">${esc(d.display_name || d.device_id)}</option>`).join('');
+    showModal(`
+      <h2>Create Share Invite</h2>
+      <form onsubmit="return Shares.createInvite(event)">
+        <label>Device<select id="invite-device" required>${opts || '<option value="">No owned devices</option>'}</select></label>
+        <label>Grantee Email<input type="email" id="invite-email" required placeholder="bob@example.com"/></label>
+        <div class="actions">
+          <button class="secondary" type="button" onclick="closeModal()">Cancel</button>
+          <button type="submit" ${opts ? '' : 'disabled'}>Send Invite</button>
+        </div>
+      </form>
+    `);
+  },
+
+  async createInvite(e) {
+    e.preventDefault();
+    const deviceId = $('#invite-device').value;
+    const email = $('#invite-email').value.trim();
+    if (!deviceId || !email) return false;
+    try {
+      const r = await api('/shares/invites', {
+        method: 'POST',
+        body: JSON.stringify({ deviceId, email }),
+      });
+      const data = await r.json();
+      if (r.ok) {
+        closeModal();
+        showModal(`
+          <h2>Invite Created</h2>
+          <p style="margin-bottom:12px">Share this URL with the grantee:</p>
+          <input value="${esc(data.inviteUrl || '')}" readonly onclick="this.select()"/>
+          <div class="actions"><button onclick="closeModal()">Done</button></div>
+        `);
+        this.load();
+      } else {
+        alert(data.error || 'Failed to create invite');
+      }
+    } catch (e) { alert('Failed: ' + e.message); }
+    return false;
+  },
+
+  async revoke(grantId) {
+    if (!confirm('Revoke this share?')) return;
+    try {
+      await api('/shares/grants/' + grantId + '/revoke', { method: 'POST' });
+      this.load();
+    } catch (e) { alert('Failed: ' + e.message); }
+  }
+};
+
+// ========== Tab Navigation ==========
+function switchTab(tabName) {
+  $$('nav button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === tabName);
+  });
+  $$('main > section').forEach(s => s.classList.remove('active'));
+  $(`#tab-${tabName}`)?.classList.add('active');
+  if (tabName === 'dashboard') Dashboard.refresh();
+  if (tabName === 'devices') Devices.load();
+  if (tabName === 'shares') Shares.load();
+}
+
+function initTabs() {
+  $$('nav button').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+}
+
+// ========== App ==========
+const App = {
+  async init() {
+    initTabs();
+    Dashboard.refresh();
+    await Devices.load();
+    Devices.startSSE();
+  }
+};
+
+// Boot
+Auth.init();
+</script>
+</body>
+</html>
