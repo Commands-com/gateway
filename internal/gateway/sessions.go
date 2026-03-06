@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -582,7 +583,10 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 			})
 		}
 		// Rollback the idempotency reservation so the client can retry
-		h.releaseIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey)
+		if err := h.releaseIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey); err != nil {
+			slog.Warn("idempotency key release failed; client may see duplicate_request until TTL expires",
+				"session", sessionID, "err", err)
+		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error":           "agent_unavailable",
 			"session_id":      sessionID,

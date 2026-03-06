@@ -78,9 +78,9 @@ func (h *Handler) checkAndReserveIdempotencyKey(ctx context.Context, sessionID, 
 	return h.store.CheckAndReserveIdempotencyKey(ctx, compound, ttl)
 }
 
-func (h *Handler) releaseIdempotencyKey(ctx context.Context, sessionID, requesterUID, idempotencyKey string) {
+func (h *Handler) releaseIdempotencyKey(ctx context.Context, sessionID, requesterUID, idempotencyKey string) error {
 	compound := fmt.Sprintf("%s:%s:%s", sessionID, requesterUID, idempotencyKey)
-	_ = h.store.ReleaseIdempotencyKey(ctx, compound)
+	return h.store.ReleaseIdempotencyKey(ctx, compound)
 }
 
 func (h *Handler) validateAndAdvanceTransportFrame(deviceID string, connState *agentConn, frame map[string]any) string {

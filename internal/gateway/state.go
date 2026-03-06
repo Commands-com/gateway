@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -232,7 +233,9 @@ func (h *Handler) sweepStaleSessions(now time.Time) {
 
 	// Sweep expired idempotency keys if the store supports it.
 	if sweeper, ok := h.store.(IdempotencyKeySweeper); ok {
-		_ = sweeper.SweepExpiredIdempotencyKeys(ctx)
+		if err := sweeper.SweepExpiredIdempotencyKeys(ctx); err != nil {
+			slog.Warn("idempotency key sweep failed", "err", err)
+		}
 	}
 
 	cutoff := now.Add(-sessionMaxIdleAge).Unix()
