@@ -110,7 +110,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		t.Fatalf("list grants by device before revoke failed: %v", err)
 	}
 	indexed := len(grantsBefore)
-	hasAccessBeforeRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
+	hasAccessBeforeRevoke := h.canAccessDevice("collab1", "devowner1")
 	if indexed != 1 {
 		t.Fatalf("expected 1 indexed grant for device, got %d", indexed)
 	}
@@ -125,7 +125,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		t.Fatalf("list grants by device after revoke failed: %v", err)
 	}
 	indexed = len(grantsAfter)
-	hasAccessAfterRevoke := h.canAccessDeviceLocked("collab1", "devowner1")
+	hasAccessAfterRevoke := h.canAccessDevice("collab1", "devowner1")
 	if indexed != 0 {
 		t.Fatalf("expected 0 indexed grants after revoke, got %d", indexed)
 	}

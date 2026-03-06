@@ -85,7 +85,7 @@ func (h *Handler) GetDeviceIdentityKey(c fiber.Ctx) error {
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
-	if !h.canAccessDeviceLocked(principal.UID, deviceID) {
+	if !h.canAccessDevice(principal.UID, deviceID) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -96,7 +96,7 @@ func (h *Handler) GetDeviceIdentityKey(c fiber.Ctx) error {
 	})
 }
 
-func (h *Handler) canAccessDeviceLocked(uid, deviceID string) bool {
+func (h *Handler) canAccessDevice(uid, deviceID string) bool {
 	device, found, err := h.store.GetDevice(context.Background(), deviceID)
 	if err != nil || !found {
 		return false
@@ -105,5 +105,5 @@ func (h *Handler) canAccessDeviceLocked(uid, deviceID string) bool {
 		return true
 	}
 	now := time.Now().UTC().Unix()
-	return h.hasActiveGrantLocked(deviceID, uid, now)
+	return h.hasActiveGrant(deviceID, uid, now)
 }

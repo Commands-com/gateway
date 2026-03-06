@@ -21,6 +21,7 @@ import (
 const (
 	tunnelPingInterval           = 30 * time.Second
 	tunnelPongTimeout            = 10 * time.Second
+	wsReadDeadline               = 60 * time.Second
 	inflightSweepInterval        = 10 * time.Second
 	inflightRequestMaxAge        = 2 * time.Minute
 	routeLeaseTTL                = 15 * time.Second
@@ -161,6 +162,24 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 
 	var replaced *tunnelConn
 	h.mu.Lock()
+	// Re-check per-owner tunnel connection limit under write lock to prevent
+	// concurrent connection attempts from exceeding the limit.
+	ownerTunnelCount := 0
+	for did, conn := range h.tunnelConns {
+		if conn.ownerUID == ownerUID && did != deviceID {
+			ownerTunnelCount++
+		}
+	}
+	if ownerTunnelCount >= maxTunnelConnectionsPerOwner {
+		h.mu.Unlock()
+		_ = c.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "too_many_connections"),
+			time.Now().Add(2*time.Second),
+		)
+		_ = c.Close()
+		return
+	}
 	if existing, ok := h.tunnelConns[deviceID]; ok {
 		replaced = existing
 	}
@@ -192,6 +211,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 				err := state.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(tunnelPongTimeout))
 				state.sendMu.Unlock()
 				if err != nil {
+					_ = c.Close()
 					return
 				}
 			}
@@ -199,7 +219,9 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	}()
 	go h.startTunnelLeaseHeartbeat(state, stopLease)
 
+	_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
 	c.SetPongHandler(func(string) error {
+		_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
 		h.mu.Lock()
 		if current, ok := h.tunnelConns[deviceID]; ok && current == state {
 			current.lastSeenAt = time.Now().UTC()
@@ -214,6 +236,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 			break
 		}
 
+		_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
 		h.mu.Lock()
 		if current, ok := h.tunnelConns[deviceID]; ok && current == state {
 			current.lastSeenAt = time.Now().UTC()

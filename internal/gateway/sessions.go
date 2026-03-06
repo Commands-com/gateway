@@ -73,7 +73,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	if !exists {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
-	if !h.canAccessDeviceLocked(principal.UID, deviceID) {
+	if !h.canAccessDevice(principal.UID, deviceID) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -743,5 +743,5 @@ func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
 	}
 
 	now := time.Now().UTC().Unix()
-	return h.hasActiveGrantLocked(deviceID, uid, now)
+	return h.hasActiveGrant(deviceID, uid, now)
 }

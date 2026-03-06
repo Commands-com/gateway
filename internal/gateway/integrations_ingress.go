@@ -59,12 +59,8 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 	}
 
-	if route != nil {
-		route.TokenLastUsedAt = now.Format(time.RFC3339)
-		route.UpdatedAt = now.Format(time.RFC3339)
-		if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
-			log.Printf("[ingress] route_update_failed route=%s: %v", routeID, err)
-		}
+	if err := h.store.TouchIntegrationRouteLastUsed(context.Background(), routeID, now.Format(time.RFC3339)); err != nil {
+		log.Printf("[ingress] route_touch_failed route=%s: %v", routeID, err)
 	}
 
 	headers := make([][]string, 0)

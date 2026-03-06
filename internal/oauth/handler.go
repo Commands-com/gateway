@@ -78,3 +78,11 @@ func (h *Handler) WellKnown(c fiber.Ctx) error {
 func (h *Handler) JWKS(c fiber.Ctx) error {
 	return c.JSON(h.jwt.JWKS())
 }
+
+// Close stops background goroutines (e.g. the memory store sweeper).
+// Safe to call multiple times.
+func (h *Handler) Close() {
+	if h.store != nil {
+		h.store.close()
+	}
+}

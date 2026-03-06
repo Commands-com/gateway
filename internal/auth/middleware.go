@@ -70,6 +70,35 @@ func RequireUser(jm *jwt.Manager) fiber.Handler {
 	}
 }
 
+// OptionalUser parses the JWT if present but does not reject unauthenticated
+// requests. Downstream handlers can check auth.PrincipalFromContext to decide
+// whether to return detailed or minimal responses.
+func OptionalUser(jm *jwt.Manager) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		token := bearer(c.Get("Authorization"))
+		if token == "" {
+			return c.Next()
+		}
+		claims, err := jm.ParseAccessToken(token)
+		if err != nil {
+			return c.Next()
+		}
+		subject := strings.TrimSpace(claims.Subject)
+		if subject == "" {
+			return c.Next()
+		}
+		principal := &Principal{
+			UID:         subject,
+			Email:       strings.TrimSpace(claims.Email),
+			DisplayName: strings.TrimSpace(claims.Name),
+			Scopes:      normalizeScopes(strings.Fields(strings.TrimSpace(claims.Scope))),
+		}
+		c.Locals(principalCtxKey, principal)
+		c.Locals("claims", claims)
+		return c.Next()
+	}
+}
+
 func RequireScopes(required ...string) fiber.Handler {
 	normalizedRequired := normalizeScopes(required)
 	return func(c fiber.Ctx) error {

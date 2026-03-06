@@ -15,10 +15,13 @@ type RouteLease struct {
 }
 
 type SessionMutator func(*sessionState) error
+type IntegrationRouteMutator func(*integrationRoute) error
 
 var (
 	ErrSessionNotFound        = errors.New("session_not_found")
 	ErrSessionVersionConflict = errors.New("session_version_conflict")
+	ErrRouteNotFound          = errors.New("route_not_found")
+	ErrRouteVersionConflict   = errors.New("route_version_conflict")
 )
 
 type StateStore interface {
@@ -48,7 +51,10 @@ type StateStore interface {
 	// Integration routes
 	SaveIntegrationRoute(ctx context.Context, route *integrationRoute) error
 	GetIntegrationRoute(ctx context.Context, routeID string) (*integrationRoute, bool, error)
+	UpdateIntegrationRoute(ctx context.Context, routeID string, mutateFn IntegrationRouteMutator) (*integrationRoute, error)
+	SetIntegrationRouteStatus(ctx context.Context, routeID string, status string, updatedAt string) error
 	DeleteIntegrationRoute(ctx context.Context, routeID string) error
+	TouchIntegrationRouteLastUsed(ctx context.Context, routeID string, ts string) error
 	ListIntegrationRoutesByOwner(ctx context.Context, ownerUID string) ([]*integrationRoute, error)
 	SetActiveRouteDevice(ctx context.Context, routeID, deviceID string) error
 	GetActiveRouteDevice(ctx context.Context, routeID string) (string, bool, error)
@@ -353,6 +359,14 @@ func (s *InMemoryStateStore) SaveIntegrationRoute(_ context.Context, route *inte
 
 	stored := cloneIntegrationRoute(route)
 	old, hadOld := s.integrationRoutes[stored.RouteID]
+	if hadOld && old != nil {
+		if stored.Version <= 0 || stored.Version != old.Version {
+			return ErrRouteVersionConflict
+		}
+		stored.Version = old.Version + 1
+	} else if stored.Version <= 0 {
+		stored.Version = 1
+	}
 	s.integrationRoutes[stored.RouteID] = stored
 	if stored.OwnerUID != "" {
 		if _, ok := s.integrationRouteOwnerIDs[stored.OwnerUID]; !ok {
@@ -368,6 +382,68 @@ func (s *InMemoryStateStore) SaveIntegrationRoute(_ context.Context, route *inte
 			}
 		}
 	}
+	return nil
+}
+
+func (s *InMemoryStateStore) UpdateIntegrationRoute(_ context.Context, routeID string, mutateFn IntegrationRouteMutator) (*integrationRoute, error) {
+	if mutateFn == nil {
+		return nil, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.integrationRoutes[routeID]
+	if !ok || current == nil {
+		return nil, ErrRouteNotFound
+	}
+
+	working := cloneIntegrationRoute(current)
+	baseVersion := working.Version
+	if baseVersion <= 0 {
+		baseVersion = 1
+	}
+	working.Version = baseVersion
+
+	if err := mutateFn(working); err != nil {
+		return nil, err
+	}
+	if current.Version != baseVersion {
+		return nil, ErrRouteVersionConflict
+	}
+
+	working.Version = baseVersion + 1
+	s.integrationRoutes[routeID] = working
+	// Update owner index if owner changed
+	if current.OwnerUID != working.OwnerUID {
+		if current.OwnerUID != "" {
+			if ownerRoutes, has := s.integrationRouteOwnerIDs[current.OwnerUID]; has {
+				delete(ownerRoutes, routeID)
+				if len(ownerRoutes) == 0 {
+					delete(s.integrationRouteOwnerIDs, current.OwnerUID)
+				}
+			}
+		}
+		if working.OwnerUID != "" {
+			if _, has := s.integrationRouteOwnerIDs[working.OwnerUID]; !has {
+				s.integrationRouteOwnerIDs[working.OwnerUID] = make(map[string]struct{})
+			}
+			s.integrationRouteOwnerIDs[working.OwnerUID][routeID] = struct{}{}
+		}
+	}
+	return cloneIntegrationRoute(working), nil
+}
+
+func (s *InMemoryStateStore) SetIntegrationRouteStatus(_ context.Context, routeID string, status string, updatedAt string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	route, ok := s.integrationRoutes[routeID]
+	if !ok || route == nil {
+		return nil
+	}
+	route.Status = status
+	route.UpdatedAt = updatedAt
+	route.Version++
 	return nil
 }
 
@@ -415,6 +491,18 @@ func (s *InMemoryStateStore) ListIntegrationRoutesByOwner(_ context.Context, own
 		out = append(out, cloneIntegrationRoute(route))
 	}
 	return out, nil
+}
+
+func (s *InMemoryStateStore) TouchIntegrationRouteLastUsed(_ context.Context, routeID string, ts string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	route, ok := s.integrationRoutes[routeID]
+	if !ok || route == nil {
+		return nil
+	}
+	route.TokenLastUsedAt = ts
+	route.UpdatedAt = ts
+	return nil
 }
 
 func (s *InMemoryStateStore) SetActiveRouteDevice(_ context.Context, routeID, deviceID string) error {

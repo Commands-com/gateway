@@ -193,12 +193,19 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 	}
 	h.flushPendingHandshakes(deviceID)
 
+	_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
+	c.SetPongHandler(func(string) error {
+		_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
+		return nil
+	})
+
 	for {
 		messageType, payload, err := c.ReadMessage()
 		if err != nil {
 			break
 		}
 
+		_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
 		h.mu.Lock()
 		if current, ok := h.agents[deviceID]; ok && current == state {
 			current.lastSeenAt = time.Now().UTC()
@@ -571,6 +578,7 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 			delete(h.agents, deviceID)
 		}
 		h.mu.Unlock()
+		_ = conn.conn.Close()
 		return fmt.Errorf("agent_unavailable")
 	}
 	return nil

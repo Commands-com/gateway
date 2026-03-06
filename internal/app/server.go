@@ -126,7 +126,7 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	oauthGroup.Post("/token/revoke", oauthHandler.RevokeToken)
 
 	gatewayGroup := app.Group("/gateway/v1")
-	gatewayGroup.Get("/health", gatewayHandler.Health)
+	gatewayGroup.Get("/health", auth.OptionalUser(jwtManager), gatewayHandler.Health)
 	gatewayGroup.Use(auth.RequireUser(jwtManager))
 
 	gatewayGroup.Put("/devices/:device_id/identity-key", auth.RequireScopes(auth.ScopeDevice), gatewayHandler.PutDeviceIdentityKey)
@@ -167,6 +167,7 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	// Register shutdown hook to stop background sweeper goroutines
 	app.Hooks().OnPostShutdown(func(_ error) error {
 		gatewayHandler.Close()
+		oauthHandler.Close()
 		return nil
 	})
 
