@@ -11,27 +11,27 @@ import (
 )
 
 const (
-	defaultInviteTTLSeconds int64 = 7 * 24 * 60 * 60
-	maxInviteTTLSeconds     int64 = 90 * 24 * 60 * 60
-	maxEventBacklog               = 1000
-	maxInflightRequests           = 1000
-	sessionSweepInterval          = 5 * time.Minute
-	sessionMaxIdleAge             = 24 * time.Hour
-	presenceTTL                   = 60 * time.Second
-	presenceRenewInterval         = 20 * time.Second
-	presenceLastSeenDebounce      = 30 * time.Second
-	presenceStoreTimeout          = 2 * time.Second
-	deviceBusPublishTimeout       = 250 * time.Millisecond
+	defaultInviteTTLSeconds  int64 = 7 * 24 * 60 * 60
+	maxInviteTTLSeconds      int64 = 90 * 24 * 60 * 60
+	maxEventBacklog                = 1000
+	maxInflightRequests            = 1000
+	sessionSweepInterval           = 5 * time.Minute
+	sessionMaxIdleAge              = 24 * time.Hour
+	presenceTTL                    = 60 * time.Second
+	presenceRenewInterval          = 20 * time.Second
+	presenceLastSeenDebounce       = 30 * time.Second
+	presenceStoreTimeout           = 2 * time.Second
+	deviceBusPublishTimeout        = 250 * time.Millisecond
 )
 
 type Handler struct {
 	cfg *config.Config
 
 	// Protects handler-local volatile state (agents, tunnels, inflight, subs).
-	mu     *sync.RWMutex
-	store  StateStore
-	bus    MessageBus
-	nodeID string
+	mu             *sync.RWMutex
+	store          StateStore
+	bus            MessageBus
+	nodeID         string
 	subs           map[string]map[*sseSubscriber]struct{}
 	sessionBusSubs map[string]*sessionBusSub
 

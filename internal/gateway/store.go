@@ -119,15 +119,15 @@ type IdempotencyKeySweeper interface {
 type InMemoryStateStore struct {
 	mu sync.RWMutex
 
-	devices        map[string]deviceRecord
-	devicesByOwner map[string]map[string]struct{}
-	grants             map[string]*shareGrant
-	grantsByDevice     map[string][]*shareGrant
-	allGrantsByDevice  map[string]map[string]struct{} // device→grantIDs (includes revoked)
-	grantsByGrantee    map[string]map[string]struct{}
-	inviteToID         map[string]string
-	sessions         map[string]*sessionState
-	sessionsByDevice map[string]map[string]struct{}
+	devices           map[string]deviceRecord
+	devicesByOwner    map[string]map[string]struct{}
+	grants            map[string]*shareGrant
+	grantsByDevice    map[string][]*shareGrant
+	allGrantsByDevice map[string]map[string]struct{} // device→grantIDs (includes revoked)
+	grantsByGrantee   map[string]map[string]struct{}
+	inviteToID        map[string]string
+	sessions          map[string]*sessionState
+	sessionsByDevice  map[string]map[string]struct{}
 
 	integrationRoutes        map[string]*integrationRoute
 	integrationRouteOwnerIDs map[string]map[string]struct{}

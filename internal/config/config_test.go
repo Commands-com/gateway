@@ -7,12 +7,12 @@ import (
 
 func TestValidateRequiresJWTSigningKey(t *testing.T) {
 	cfg := &Config{
-		AuthMode:         AuthModeDemo,
-		StateBackend:     StateBackendMemory,
-		NodeID:           "test",
-		OAuthDefaultClientID: "client",
-		OAuthClientName:      "name",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		AuthMode:                    AuthModeDemo,
+		StateBackend:                StateBackendMemory,
+		NodeID:                      "test",
+		OAuthDefaultClientID:        "client",
+		OAuthClientName:             "name",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,
@@ -27,13 +27,13 @@ func TestValidateRequiresJWTSigningKey(t *testing.T) {
 
 func TestValidateRequiresMinKeyLength(t *testing.T) {
 	cfg := &Config{
-		JWTSigningKey:    "short",
-		AuthMode:         AuthModeDemo,
-		StateBackend:     StateBackendMemory,
-		NodeID:           "test",
-		OAuthDefaultClientID: "client",
-		OAuthClientName:      "name",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		JWTSigningKey:               "short",
+		AuthMode:                    AuthModeDemo,
+		StateBackend:                StateBackendMemory,
+		NodeID:                      "test",
+		OAuthDefaultClientID:        "client",
+		OAuthClientName:             "name",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,
@@ -48,13 +48,13 @@ func TestValidateRequiresMinKeyLength(t *testing.T) {
 
 func TestValidateAcceptsValidConfig(t *testing.T) {
 	cfg := &Config{
-		JWTSigningKey:    "this-is-a-valid-signing-key-with-32b",
-		AuthMode:         AuthModeDemo,
-		StateBackend:     StateBackendMemory,
-		NodeID:           "test-node",
-		OAuthDefaultClientID: "client-id",
-		OAuthClientName:      "Test App",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		JWTSigningKey:               "this-is-a-valid-signing-key-with-32b",
+		AuthMode:                    AuthModeDemo,
+		StateBackend:                StateBackendMemory,
+		NodeID:                      "test-node",
+		OAuthDefaultClientID:        "client-id",
+		OAuthClientName:             "Test App",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,
@@ -69,13 +69,13 @@ func TestValidateAcceptsValidConfig(t *testing.T) {
 
 func TestValidateRejectsUnsupportedStateBackend(t *testing.T) {
 	cfg := &Config{
-		JWTSigningKey:    "this-is-a-valid-signing-key-with-32b",
-		AuthMode:         AuthModeDemo,
-		StateBackend:     "redis",
-		NodeID:           "test-node",
-		OAuthDefaultClientID: "client-id",
-		OAuthClientName:      "Test App",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		JWTSigningKey:               "this-is-a-valid-signing-key-with-32b",
+		AuthMode:                    AuthModeDemo,
+		StateBackend:                "redis",
+		NodeID:                      "test-node",
+		OAuthDefaultClientID:        "client-id",
+		OAuthClientName:             "Test App",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,
@@ -90,13 +90,13 @@ func TestValidateRejectsUnsupportedStateBackend(t *testing.T) {
 
 func TestValidateRejectsFirebaseWithoutProjectID(t *testing.T) {
 	cfg := &Config{
-		JWTSigningKey:    "this-is-a-valid-signing-key-with-32b",
-		AuthMode:         AuthModeFirebase,
-		StateBackend:     StateBackendMemory,
-		NodeID:           "test-node",
-		OAuthDefaultClientID: "client-id",
-		OAuthClientName:      "Test App",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		JWTSigningKey:               "this-is-a-valid-signing-key-with-32b",
+		AuthMode:                    AuthModeFirebase,
+		StateBackend:                StateBackendMemory,
+		NodeID:                      "test-node",
+		OAuthDefaultClientID:        "client-id",
+		OAuthClientName:             "Test App",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,
@@ -111,13 +111,13 @@ func TestValidateRejectsFirebaseWithoutProjectID(t *testing.T) {
 
 func TestValidateRejectsOIDCWithoutIssuer(t *testing.T) {
 	cfg := &Config{
-		JWTSigningKey:    "this-is-a-valid-signing-key-with-32b",
-		AuthMode:         AuthModeOIDC,
-		StateBackend:     StateBackendMemory,
-		NodeID:           "test-node",
-		OAuthDefaultClientID: "client-id",
-		OAuthClientName:      "Test App",
-		OAuthRedirectURIs:    []string{"http://localhost/cb"},
+		JWTSigningKey:               "this-is-a-valid-signing-key-with-32b",
+		AuthMode:                    AuthModeOIDC,
+		StateBackend:                StateBackendMemory,
+		NodeID:                      "test-node",
+		OAuthDefaultClientID:        "client-id",
+		OAuthClientName:             "Test App",
+		OAuthRedirectURIs:           []string{"http://localhost/cb"},
 		IngressRateWindowSeconds:    60,
 		IngressGlobalLimitPerWindow: 100,
 		IngressIPLimitPerWindow:     50,

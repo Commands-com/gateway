@@ -7,7 +7,7 @@ import (
 )
 
 // commandsLogoSVG is the Commands.com terminal logo (uses currentColor, works on any theme).
-const commandsLogoSVG = `<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" style="width:40px;height:40px;margin-bottom:16px">
+const commandsLogoSVG = `<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" style="width:36px;height:36px;margin-bottom:12px">
   <rect x="1" y="1" width="30" height="30" rx="4" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
   <polyline points="9 10 16 16 9 22" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
   <rect x="21" y="8" width="2" height="16" fill="currentColor"><animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/></rect>

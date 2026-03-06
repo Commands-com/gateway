@@ -143,4 +143,3 @@ func normalizeScopes(scopes []string) []string {
 	}
 	return clean
 }
-
