@@ -21,6 +21,7 @@ const (
 	presenceRenewInterval         = 20 * time.Second
 	presenceLastSeenDebounce      = 30 * time.Second
 	presenceStoreTimeout          = 2 * time.Second
+	deviceBusPublishTimeout       = 250 * time.Millisecond
 )
 
 type Handler struct {
@@ -278,7 +279,11 @@ func (h *Handler) notifyDeviceStateChange() {
 	h.deviceStateNotify = make(chan struct{})
 	h.mu.Unlock()
 	close(ch)
-	_ = h.bus.PublishDeviceEvent(context.Background())
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), deviceBusPublishTimeout)
+	defer pubCancel()
+	if err := h.bus.PublishDeviceEvent(pubCtx); err != nil {
+		slog.Warn("device-state bus publish failed", "err", err)
+	}
 }
 
 // Close stops background sweeper goroutines. Safe to call multiple times.

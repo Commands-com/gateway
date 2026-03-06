@@ -558,6 +558,10 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 			return nil
 		})
 		if errors.Is(err, replayErr) {
+			if err := h.releaseIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey); err != nil {
+				slog.Warn("idempotency key release failed on replay",
+					"session", sessionID, "err", err)
+			}
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"error":           "replay_detected",
 				"violation":       "replay_detected",
@@ -566,6 +570,10 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 			})
 		}
 		if err != nil {
+			if err := h.releaseIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey); err != nil {
+				slog.Warn("idempotency key release failed on session update error",
+					"session", sessionID, "err", err)
+			}
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
 		}
 		state = updated
