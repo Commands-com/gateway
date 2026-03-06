@@ -164,7 +164,7 @@ paths:
       summary: Stream device status events (SSE)
       description: |
         Requires authenticated user token.
-        Returns `text/event-stream` with heartbeat comments and `device_status` events.
+        Returns `text/event-stream` with heartbeat comments and `device.status` events.
       responses:
         '200':
           description: SSE stream

@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -66,6 +66,7 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	)
 
 	app := fiber.New(fiber.Config{
+		ProxyHeader: cfg.ProxyHeader,
 		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			if fe, ok := err.(*fiber.Error); ok {
@@ -117,13 +118,18 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	app.Get("/.well-known/jwks.json", oauthHandler.JWKS)
 	app.Post("/register", oauthHandler.Register)
 
+	oauthLimiter := gateway.NewOAuthRateLimiter(
+		30,
+		time.Duration(cfg.IngressRateWindowSeconds)*time.Second,
+	)
+
 	oauthGroup := app.Group("/oauth")
 	oauthGroup.Get("/.well-known/openid-configuration", oauthHandler.WellKnown)
 	oauthGroup.Get("/.well-known/jwks.json", oauthHandler.JWKS)
-	oauthGroup.Get("/authorize", oauthHandler.Authorize)
-	oauthGroup.Post("/authorize", oauthHandler.Authorize)
-	oauthGroup.Post("/token", oauthHandler.Token)
-	oauthGroup.Post("/token/revoke", oauthHandler.RevokeToken)
+	oauthGroup.Get("/authorize", oauthLimiter.Middleware(), oauthHandler.Authorize)
+	oauthGroup.Post("/authorize", oauthLimiter.Middleware(), oauthHandler.Authorize)
+	oauthGroup.Post("/token", oauthLimiter.Middleware(), oauthHandler.Token)
+	oauthGroup.Post("/token/revoke", oauthLimiter.Middleware(), oauthHandler.RevokeToken)
 
 	gatewayGroup := app.Group("/gateway/v1")
 	gatewayGroup.Get("/health", auth.OptionalUser(jwtManager), gatewayHandler.Health)
@@ -173,9 +179,9 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 		return nil
 	})
 
-	log.Printf("gateway startup auth_mode=%s state_backend=%s public_base_url=%s node_id=%s", cfg.AuthMode, cfg.StateBackend, cfg.PublicBaseURL, cfg.NodeID)
+	slog.Info("gateway startup", "auth_mode", cfg.AuthMode, "state_backend", cfg.StateBackend, "public_base_url", cfg.PublicBaseURL, "node_id", cfg.NodeID)
 	if cfg.AuthMode == config.AuthModeDemo {
-		log.Printf("warning: AUTH_MODE=demo is non-production")
+		slog.Warn("AUTH_MODE=demo is non-production")
 	}
 
 	return app, nil

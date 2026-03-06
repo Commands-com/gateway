@@ -16,6 +16,10 @@ const (
 	maxInflightRequests           = 1000
 	sessionSweepInterval          = 5 * time.Minute
 	sessionMaxIdleAge             = 24 * time.Hour
+	presenceTTL                   = 60 * time.Second
+	presenceRenewInterval         = 20 * time.Second
+	presenceLastSeenDebounce      = 30 * time.Second
+	presenceStoreTimeout          = 2 * time.Second
 )
 
 type Handler struct {
@@ -26,7 +30,8 @@ type Handler struct {
 	store  StateStore
 	bus    MessageBus
 	nodeID string
-	subs   map[string]map[*sseSubscriber]struct{}
+	subs           map[string]map[*sseSubscriber]struct{}
+	sessionBusSubs map[string]*sessionBusSub
 
 	agents                map[string]*agentConn
 	agentConnCountByOwner map[string]int
@@ -35,14 +40,15 @@ type Handler struct {
 	tunnelConnCountByOwner map[string]int
 	inflightRequests       map[string]*inflightRequest
 
-	idempotencyMu   sync.Mutex
-	idempotencyKeys map[string]time.Time
-
 	transportTokenIssuer *TransportTokenIssuer
 	transportTokenTTL    time.Duration
 
 	agentWriteFn  func(*agentConn, map[string]any) error
 	tunnelWriteFn func(*tunnelConn, map[string]any) error
+
+	// deviceStateNotify is closed-and-replaced whenever an agent connects or
+	// disconnects, waking any device-events SSE streams to re-check state.
+	deviceStateNotify chan struct{}
 
 	done chan struct{} // closed on Shutdown to stop background goroutines
 }
@@ -54,6 +60,13 @@ type deviceRecord struct {
 	OwnerEmail  string
 	IdentityKey string
 	UpdatedAt   int64
+
+	// Connection presence — written by SetDeviceOnline/SetDeviceOffline.
+	Connected         bool
+	ConnectedNodeID   string
+	ConnectedAt       int64
+	LastSeenAt        int64
+	PresenceExpiresAt int64
 }
 
 type shareGrant struct {
@@ -101,6 +114,11 @@ type sessionState struct {
 type sessionEvent struct {
 	ID   string
 	Data []byte
+
+	// OriginNodeID is set when publishing to the MessageBus so receivers
+	// can skip events that originated on their own node.  It is not
+	// persisted by the store — only used in bus transit.
+	OriginNodeID string
 }
 
 type putDeviceIdentityKeyRequest struct {
@@ -163,14 +181,15 @@ func NewHandlerWithOptions(cfg *config.Config, opts HandlerOptions) *Handler {
 		bus:                    bus,
 		nodeID:                 nodeID,
 		subs:                   make(map[string]map[*sseSubscriber]struct{}),
+		sessionBusSubs:         make(map[string]*sessionBusSub),
 		agents:                 make(map[string]*agentConn),
 		agentConnCountByOwner:  make(map[string]int),
 		tunnelConns:            make(map[string]*tunnelConn),
 		tunnelConnCountByOwner: make(map[string]int),
 		inflightRequests:       make(map[string]*inflightRequest),
-		idempotencyKeys:        make(map[string]time.Time),
 		transportTokenIssuer:   transportTokenIssuer,
 		transportTokenTTL:      transportTokenTTL,
+		deviceStateNotify:      make(chan struct{}),
 		done:                   make(chan struct{}),
 	}
 
@@ -181,7 +200,6 @@ func NewHandlerWithOptions(cfg *config.Config, opts HandlerOptions) *Handler {
 		return tc.writeJSON(payload)
 	}
 	h.startInflightSweeper()
-	h.startIdempotencySweeper()
 	h.startSessionSweeper()
 	return h
 }
@@ -202,8 +220,23 @@ func (h *Handler) startSessionSweeper() {
 }
 
 func (h *Handler) sweepStaleSessions(now time.Time) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-h.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	// Sweep expired idempotency keys if the store supports it.
+	if sweeper, ok := h.store.(IdempotencyKeySweeper); ok {
+		_ = sweeper.SweepExpiredIdempotencyKeys(ctx)
+	}
+
 	cutoff := now.Add(-sessionMaxIdleAge).Unix()
-	sessions, err := h.store.ListSessions(context.Background())
+	sessions, err := h.store.ListStaleSessions(ctx, cutoff)
 	if err != nil {
 		return
 	}
@@ -211,26 +244,38 @@ func (h *Handler) sweepStaleSessions(now time.Time) {
 		if sess == nil {
 			continue
 		}
-		if sess.UpdatedAt > cutoff {
-			continue
+		// Don't reap sessions whose agent is still connected — the
+		// handshake may still complete (pending) or the session may
+		// still be in active use (acknowledged).
+		if sess.DeviceID != "" {
+			switch sess.Status {
+			case "agent_acknowledged", "pending_agent_ack", "pending_agent_connection":
+				dev, found, err := h.store.GetDevice(ctx, sess.DeviceID)
+				if err != nil {
+					// Store read failed — skip this session to avoid
+					// deleting an active session on a transient error.
+					continue
+				}
+				if found && dev.Connected &&
+					(dev.PresenceExpiresAt == 0 || now.Unix() <= dev.PresenceExpiresAt) {
+					continue
+				}
+			}
 		}
-		// Don't reap sessions in an active state — the agent may be
-		// connected on a different node in a multi-node deployment.
-		if isActiveSessionStatus(sess.Status) {
-			continue
-		}
-		_ = h.store.DeleteSessionEvents(context.Background(), sess.SessionID)
-		_ = h.store.DeleteSession(context.Background(), sess.SessionID)
+		_ = h.store.DeleteSessionEvents(ctx, sess.SessionID)
+		_ = h.store.DeleteSession(ctx, sess.SessionID)
 	}
 }
 
-func isActiveSessionStatus(status string) bool {
-	switch status {
-	case "pending_agent_ack", "pending_agent_connection", "agent_acknowledged":
-		return true
-	default:
-		return false
-	}
+// notifyDeviceStateChange wakes all local device-events SSE listeners and
+// publishes to the bus so listeners on other nodes are woken too.
+func (h *Handler) notifyDeviceStateChange() {
+	h.mu.Lock()
+	ch := h.deviceStateNotify
+	h.deviceStateNotify = make(chan struct{})
+	h.mu.Unlock()
+	close(ch)
+	_ = h.bus.PublishDeviceEvent(context.Background())
 }
 
 // Close stops background sweeper goroutines. Safe to call multiple times.

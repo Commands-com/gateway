@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,16 +34,38 @@ const (
 var wsConnIDCounter uint64
 var errRouteStatusUpdateSkipped = errors.New("route_status_update_skipped")
 
+// routeBusSub wraps a bus subscription for a single tunnel route so the
+// goroutine can identity-check whether its entry is still current in the map.
+type routeBusSub struct {
+	cancel   func()
+	unsub    func()
+	stopOnce sync.Once
+}
+
+func (rs *routeBusSub) stop() {
+	if rs == nil {
+		return
+	}
+	rs.stopOnce.Do(func() {
+		rs.cancel()
+		if rs.unsub != nil {
+			rs.unsub()
+		}
+	})
+}
+
 type tunnelConn struct {
 	deviceID        string
 	ownerUID        string
 	connID          string
 	conn            *websocket.Conn
+	ctx             context.Context
+	cancel          context.CancelFunc
 	connectedAt     time.Time
 	lastSeenAt      time.Time
 	sendMu          sync.Mutex
 	activatedRoutes map[string]bool
-	routeBusUnsubs  map[string]func()
+	routeBusSubs    map[string]*routeBusSub
 }
 
 func (tc *tunnelConn) writeJSON(payload map[string]any) error {
@@ -150,15 +172,18 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 
 	now := time.Now().UTC()
 	connID := fmt.Sprintf("tun:%d", atomic.AddUint64(&wsConnIDCounter, 1))
+	connCtx, connCancel := context.WithCancel(context.Background())
 	state := &tunnelConn{
 		deviceID:        deviceID,
 		ownerUID:        ownerUID,
 		connID:          connID,
 		conn:            c,
+		ctx:             connCtx,
+		cancel:          connCancel,
 		connectedAt:     now,
 		lastSeenAt:      now,
 		activatedRoutes: make(map[string]bool),
-		routeBusUnsubs:  make(map[string]func()),
+		routeBusSubs:    make(map[string]*routeBusSub),
 	}
 
 	var replaced *tunnelConn
@@ -191,7 +216,7 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	h.mu.Unlock()
 
 	if replaced != nil && replaced != state {
-		h.deactivateAllTunnelRoutes(replaced, "superseded")
+		h.deactivateAllTunnelRoutes(context.Background(), replaced, "superseded")
 		replaced.closeWithMessage(websocket.CloseNormalClosure, "replaced_by_new_connection")
 	}
 
@@ -250,9 +275,10 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
 			continue
 		}
-		h.handleTunnelFrame(state, payload)
+		h.handleTunnelFrame(connCtx, state, payload)
 	}
 
+	connCancel()
 	close(stopPing)
 	close(stopLease)
 
@@ -270,13 +296,13 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	h.mu.Unlock()
 
 	if wasActive {
-		h.deactivateAllTunnelRoutes(state, "connection_lost")
+		h.deactivateAllTunnelRoutes(context.Background(), state, "connection_lost")
 	}
 	h.stopAllRouteBusSubscriptions(state)
 	_ = c.Close()
 }
 
-func (h *Handler) handleTunnelFrame(tc *tunnelConn, payload []byte) {
+func (h *Handler) handleTunnelFrame(ctx context.Context, tc *tunnelConn, payload []byte) {
 	var frame map[string]any
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		_ = tc.writeJSON(map[string]any{"type": "tunnel.error", "error": "invalid_json"})
@@ -285,11 +311,11 @@ func (h *Handler) handleTunnelFrame(tc *tunnelConn, payload []byte) {
 
 	switch firstStringMap(frame, "type") {
 	case "tunnel.activate":
-		h.handleTunnelActivate(tc, frame)
+		h.handleTunnelActivate(ctx, tc, frame)
 	case "tunnel.deactivate":
-		h.handleTunnelDeactivate(tc, frame)
+		h.handleTunnelDeactivate(ctx, tc, frame)
 	case "tunnel.response":
-		h.handleTunnelResponse(tc, frame)
+		h.handleTunnelResponse(ctx, tc, frame)
 	case "ping", "heartbeat":
 		return
 	default:
@@ -304,8 +330,8 @@ func (h *Handler) startRouteBusSubscription(tc *tunnelConn, routeID string) erro
 	}
 
 	h.mu.RLock()
-	if tc.routeBusUnsubs != nil {
-		if _, exists := tc.routeBusUnsubs[routeID]; exists {
+	if tc.routeBusSubs != nil {
+		if _, exists := tc.routeBusSubs[routeID]; exists {
 			h.mu.RUnlock()
 			return nil
 		}
@@ -313,44 +339,72 @@ func (h *Handler) startRouteBusSubscription(tc *tunnelConn, routeID string) erro
 	h.mu.RUnlock()
 
 	reqCh := make(chan TunnelRequestMessage, 16)
-	ctx, cancel := context.WithCancel(context.Background())
-	unsub, err := h.bus.SubscribeTunnelRequests(ctx, routeID, reqCh)
+	subCtx, subCancel := context.WithCancel(tc.ctx)
+	unsub, err := h.bus.SubscribeTunnelRequests(subCtx, routeID, reqCh)
 	if err != nil {
-		cancel()
+		subCancel()
 		return err
 	}
-	stop := func() {
-		cancel()
-		unsub()
-	}
+
+	rs := &routeBusSub{cancel: subCancel, unsub: unsub}
 
 	h.mu.Lock()
 	current, ok := h.tunnelConns[tc.deviceID]
 	if !ok || current != tc || !tc.activatedRoutes[routeID] {
 		h.mu.Unlock()
-		stop()
+		rs.stop()
 		return nil
 	}
-	if tc.routeBusUnsubs == nil {
-		tc.routeBusUnsubs = make(map[string]func())
+	if tc.routeBusSubs == nil {
+		tc.routeBusSubs = make(map[string]*routeBusSub)
 	}
-	if _, exists := tc.routeBusUnsubs[routeID]; exists {
+	if _, exists := tc.routeBusSubs[routeID]; exists {
 		h.mu.Unlock()
-		stop()
+		rs.stop()
 		return nil
 	}
-	tc.routeBusUnsubs[routeID] = stop
+	tc.routeBusSubs[routeID] = rs
 	h.mu.Unlock()
 
 	go func() {
+		defer func() {
+			rs.stop()
+			// Remove our entry (only if it's still ours) so re-subscribe
+			// is possible, then restart if the route is still activated.
+			h.mu.Lock()
+			if tc.routeBusSubs[routeID] == rs {
+				delete(tc.routeBusSubs, routeID)
+			}
+			cur, isCurrent := h.tunnelConns[tc.deviceID]
+			stillActive := isCurrent && cur == tc && tc.activatedRoutes[routeID]
+			h.mu.Unlock()
+
+			select {
+			case <-h.done:
+				return
+			default:
+			}
+			select {
+			case <-tc.ctx.Done():
+				return
+			default:
+			}
+			if stillActive {
+				if err := h.startRouteBusSubscription(tc, routeID); err != nil {
+					slog.Warn("route bus re-subscribe failed", "route", routeID, "err", err)
+				}
+			}
+		}()
 		for {
 			select {
 			case <-h.done:
-				stop()
 				return
-			case <-ctx.Done():
+			case <-subCtx.Done():
 				return
-			case req := <-reqCh:
+			case req, ok := <-reqCh:
+				if !ok {
+					return
+				}
 				if strings.TrimSpace(req.RequestID) == "" || strings.TrimSpace(req.RouteID) != routeID {
 					continue
 				}
@@ -368,17 +422,12 @@ func (h *Handler) stopRouteBusSubscription(tc *tunnelConn, routeID string) {
 		return
 	}
 
-	var stop func()
 	h.mu.Lock()
-	if tc.routeBusUnsubs != nil {
-		stop = tc.routeBusUnsubs[routeID]
-		delete(tc.routeBusUnsubs, routeID)
-	}
+	rs := tc.routeBusSubs[routeID]
+	delete(tc.routeBusSubs, routeID)
 	h.mu.Unlock()
 
-	if stop != nil {
-		stop()
-	}
+	rs.stop()
 }
 
 func (h *Handler) stopAllRouteBusSubscriptions(tc *tunnelConn) {
@@ -386,18 +435,16 @@ func (h *Handler) stopAllRouteBusSubscriptions(tc *tunnelConn) {
 		return
 	}
 
-	stops := make([]func(), 0)
 	h.mu.Lock()
-	for routeID, stop := range tc.routeBusUnsubs {
-		delete(tc.routeBusUnsubs, routeID)
-		if stop != nil {
-			stops = append(stops, stop)
-		}
+	subs := make([]*routeBusSub, 0, len(tc.routeBusSubs))
+	for routeID, rs := range tc.routeBusSubs {
+		delete(tc.routeBusSubs, routeID)
+		subs = append(subs, rs)
 	}
 	h.mu.Unlock()
 
-	for _, stop := range stops {
-		stop()
+	for _, rs := range subs {
+		rs.stop()
 	}
 }
 
@@ -416,7 +463,7 @@ func (h *Handler) handleBusTunnelRequest(tc *tunnelConn, req TunnelRequestMessag
 	}
 	if len(h.inflightRequests) >= maxInflightRequests {
 		h.mu.Unlock()
-		_ = h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+		_ = h.bus.PublishTunnelResponse(tc.ctx, requestID, TunnelResponseMessage{
 			RequestID: requestID,
 			RouteID:   routeID,
 			Status:    fiber.StatusServiceUnavailable,
@@ -469,7 +516,7 @@ func (h *Handler) handleBusTunnelRequest(tc *tunnelConn, req TunnelRequestMessag
 		h.mu.Lock()
 		delete(h.inflightRequests, requestID)
 		h.mu.Unlock()
-		_ = h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+		_ = h.bus.PublishTunnelResponse(tc.ctx, requestID, TunnelResponseMessage{
 			RequestID: requestID,
 			RouteID:   routeID,
 			Status:    fiber.StatusServiceUnavailable,
@@ -477,7 +524,7 @@ func (h *Handler) handleBusTunnelRequest(tc *tunnelConn, req TunnelRequestMessag
 	}
 }
 
-func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
+func (h *Handler) handleTunnelActivate(ctx context.Context, tc *tunnelConn, frame map[string]any) {
 	requestID := firstStringMap(frame, "request_id")
 	if requestID == "" {
 		requestID = "act_" + uuid.New().String()[:8]
@@ -508,7 +555,7 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 		var supersededTunnel *tunnelConn
 		result := map[string]any{}
 
-		route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+		route, found, err := h.store.GetIntegrationRoute(ctx, routeID)
 		switch {
 		case err != nil:
 			result = map[string]any{
@@ -556,7 +603,7 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				},
 			}
 		default:
-			lease, claimed, err := h.store.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL)
+			lease, claimed, err := h.store.ClaimRouteLease(ctx, routeID, h.nodeID, routeLeaseTTL)
 			if err != nil {
 				result = map[string]any{
 					"route_id": routeID,
@@ -580,9 +627,9 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				break
 			}
 
-			existingDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+			existingDeviceID, active, err := h.store.GetActiveRouteDevice(ctx, routeID)
 			if err != nil {
-				_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+				_ = h.store.ReleaseRouteLease(ctx, routeID, h.nodeID)
 				result = map[string]any{
 					"route_id": routeID,
 					"status":   "rejected",
@@ -602,9 +649,9 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				h.mu.Unlock()
 				activation = "superseded"
 			}
-			if err := h.store.SetActiveRouteDevice(context.Background(), routeID, tc.deviceID); err != nil {
+			if err := h.store.SetActiveRouteDevice(ctx, routeID, tc.deviceID); err != nil {
 				if !active {
-					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+					_ = h.store.ReleaseRouteLease(ctx, routeID, h.nodeID)
 				}
 				result = map[string]any{
 					"route_id": routeID,
@@ -621,15 +668,15 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 			h.mu.Unlock()
 			if err := h.startRouteBusSubscription(tc, routeID); err != nil {
 				if active {
-					_ = h.store.SetActiveRouteDevice(context.Background(), routeID, existingDeviceID)
+					_ = h.store.SetActiveRouteDevice(ctx, routeID, existingDeviceID)
 					if supersededTunnel != nil {
 						h.mu.Lock()
 						supersededTunnel.activatedRoutes[routeID] = true
 						h.mu.Unlock()
 					}
 				} else {
-					_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+					_ = h.store.DeleteActiveRoute(ctx, routeID)
+					_ = h.store.ReleaseRouteLease(ctx, routeID, h.nodeID)
 				}
 				h.mu.Lock()
 				delete(tc.activatedRoutes, routeID)
@@ -645,17 +692,17 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				}
 				break
 			}
-			if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "active", now, true); err != nil {
+			if err := h.setTunnelRouteStatus(ctx, routeID, tc.deviceID, "active", now, true); err != nil {
 				if active {
-					_ = h.store.SetActiveRouteDevice(context.Background(), routeID, existingDeviceID)
+					_ = h.store.SetActiveRouteDevice(ctx, routeID, existingDeviceID)
 					if supersededTunnel != nil {
 						h.mu.Lock()
 						supersededTunnel.activatedRoutes[routeID] = true
 						h.mu.Unlock()
 					}
 				} else {
-					_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-					_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+					_ = h.store.DeleteActiveRoute(ctx, routeID)
+					_ = h.store.ReleaseRouteLease(ctx, routeID, h.nodeID)
 				}
 				h.mu.Lock()
 				delete(tc.activatedRoutes, routeID)
@@ -696,7 +743,7 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 	})
 }
 
-func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
+func (h *Handler) handleTunnelDeactivate(ctx context.Context, tc *tunnelConn, frame map[string]any) {
 	requestID := firstStringMap(frame, "request_id")
 	if requestID == "" {
 		requestID = "deact_" + uuid.New().String()[:8]
@@ -722,7 +769,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 			continue
 		}
 
-		activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+		activeDeviceID, active, err := h.store.GetActiveRouteDevice(ctx, routeID)
 		if err != nil {
 			results = append(results, map[string]any{
 				"route_id": routeID,
@@ -735,7 +782,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 			continue
 		}
 		if active && activeDeviceID == tc.deviceID {
-			if err := h.store.DeleteActiveRoute(context.Background(), routeID); err != nil {
+			if err := h.store.DeleteActiveRoute(ctx, routeID); err != nil {
 				results = append(results, map[string]any{
 					"route_id": routeID,
 					"status":   "rejected",
@@ -750,7 +797,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 			delete(tc.activatedRoutes, routeID)
 			h.mu.Unlock()
 			h.stopRouteBusSubscription(tc, routeID)
-			if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
+			if err := h.store.ReleaseRouteLease(ctx, routeID, h.nodeID); err != nil {
 				results = append(results, map[string]any{
 					"route_id": routeID,
 					"status":   "rejected",
@@ -761,7 +808,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 				})
 				continue
 			}
-			if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "inactive", now, false); err != nil {
+			if err := h.setTunnelRouteStatus(ctx, routeID, tc.deviceID, "inactive", now, false); err != nil {
 				results = append(results, map[string]any{
 					"route_id": routeID,
 					"status":   "rejected",
@@ -792,7 +839,7 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 	})
 }
 
-func (h *Handler) handleTunnelResponse(tc *tunnelConn, frame map[string]any) {
+func (h *Handler) handleTunnelResponse(ctx context.Context, tc *tunnelConn, frame map[string]any) {
 	requestID := firstStringMap(frame, "request_id")
 	if requestID == "" {
 		return
@@ -837,7 +884,7 @@ func (h *Handler) handleTunnelResponse(tc *tunnelConn, frame map[string]any) {
 	if found {
 		if inflight.deviceID != tc.deviceID {
 			h.mu.Unlock()
-			log.Printf("[tunnel] response ownership mismatch: request=%s expected_device=%s got_device=%s", requestID, inflight.deviceID, tc.deviceID)
+			slog.Warn("response ownership mismatch", "request", requestID, "expected_device", inflight.deviceID, "got_device", tc.deviceID)
 			_ = tc.writeJSON(map[string]any{
 				"type":       "tunnel.error",
 				"error":      "response_ownership_mismatch",
@@ -855,14 +902,14 @@ func (h *Handler) handleTunnelResponse(tc *tunnelConn, frame map[string]any) {
 	}
 
 	if inflight.publishResponseToBus {
-		if err := h.bus.PublishTunnelResponse(context.Background(), requestID, TunnelResponseMessage{
+		if err := h.bus.PublishTunnelResponse(ctx, requestID, TunnelResponseMessage{
 			RequestID:  requestID,
 			RouteID:    inflight.routeID,
 			Status:     resp.Status,
 			Headers:    resp.Headers,
 			BodyBase64: resp.BodyBase64,
 		}); err != nil {
-			log.Printf("[tunnel] bus_publish_response_failed request=%s route=%s err=%v", requestID, inflight.routeID, err)
+			slog.Warn("bus publish response failed", "request", requestID, "route", inflight.routeID, "err", err)
 		}
 		return
 	}
@@ -875,7 +922,7 @@ func (h *Handler) handleTunnelResponse(tc *tunnelConn, frame map[string]any) {
 	}
 }
 
-func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
+func (h *Handler) deactivateAllTunnelRoutes(ctx context.Context, tc *tunnelConn, reason string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	h.mu.Lock()
@@ -884,38 +931,36 @@ func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
 		routeIDs = append(routeIDs, routeID)
 	}
 	tc.activatedRoutes = make(map[string]bool)
-	stops := make([]func(), 0, len(tc.routeBusUnsubs))
-	for routeID, stop := range tc.routeBusUnsubs {
-		delete(tc.routeBusUnsubs, routeID)
-		if stop != nil {
-			stops = append(stops, stop)
-		}
+	subs := make([]*routeBusSub, 0, len(tc.routeBusSubs))
+	for routeID, rs := range tc.routeBusSubs {
+		delete(tc.routeBusSubs, routeID)
+		subs = append(subs, rs)
 	}
 	h.mu.Unlock()
-	for _, stop := range stops {
-		stop()
+	for _, rs := range subs {
+		rs.stop()
 	}
 
 	routesToDeactivate := make([]string, 0, len(routeIDs))
 	for _, routeID := range routeIDs {
-		activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+		activeDeviceID, active, err := h.store.GetActiveRouteDevice(ctx, routeID)
 		if err != nil || !active || activeDeviceID != tc.deviceID {
 			continue
 		}
-		if err := h.store.DeleteActiveRoute(context.Background(), routeID); err != nil {
+		if err := h.store.DeleteActiveRoute(ctx, routeID); err != nil {
 			continue
 		}
-		if err := h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID); err != nil {
-			log.Printf("[tunnel] failed to release lease route=%s: %v", routeID, err)
+		if err := h.store.ReleaseRouteLease(ctx, routeID, h.nodeID); err != nil {
+			slog.Warn("failed to release lease", "route", routeID, "err", err)
 		}
 		routesToDeactivate = append(routesToDeactivate, routeID)
-		if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "provisioned", now, false); err != nil {
-			log.Printf("[tunnel] failed to persist deactivation route=%s: %v", routeID, err)
+		if err := h.setTunnelRouteStatus(ctx, routeID, tc.deviceID, "provisioned", now, false); err != nil {
+			slog.Warn("failed to persist deactivation", "route", routeID, "err", err)
 		}
 	}
 
 	if reason != "" {
-		log.Printf("[tunnel] deactivated %d routes for device=%s reason=%s", len(routesToDeactivate), tc.deviceID, reason)
+		slog.Info("deactivated routes", "count", len(routesToDeactivate), "device", tc.deviceID, "reason", reason)
 	}
 }
 
@@ -993,26 +1038,26 @@ func intFromAny(raw any, fallback int) int {
 	}
 }
 
-func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any) (*inflightRequest, error) {
+func (h *Handler) sendTunnelRequest(ctx context.Context, routeID string, requestFrame map[string]any) (*inflightRequest, error) {
 	requestID := firstStringMap(requestFrame, "request_id")
 	if requestID == "" {
 		requestID = "req_" + uuid.New().String()[:12]
 		requestFrame["request_id"] = requestID
 	}
 
-	deviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+	deviceID, active, err := h.store.GetActiveRouteDevice(ctx, routeID)
 	if err != nil {
 		return nil, fmt.Errorf("active_route_lookup_failed: %w", err)
 	}
 	if !active {
 		return nil, fmt.Errorf("tunnel_not_connected")
 	}
-	_, claimed, err := h.store.GetRouteLease(context.Background(), routeID)
+	_, claimed, err := h.store.GetRouteLease(ctx, routeID)
 	if err != nil {
 		return nil, fmt.Errorf("route_lease_lookup_failed: %w", err)
 	}
 	if !claimed {
-		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+		_ = h.store.DeleteActiveRoute(ctx, routeID)
 		return nil, fmt.Errorf("route_not_claimed")
 	}
 
@@ -1034,7 +1079,7 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 	}
 
 	respCh := make(chan TunnelResponseMessage, 1)
-	subCtx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	subCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	unsub, subErr := h.bus.SubscribeTunnelResponses(subCtx, requestID, respCh)
 	if subErr != nil {
 		cancel()
@@ -1044,7 +1089,10 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 		defer cancel()
 		defer unsub()
 		select {
-		case resp := <-respCh:
+		case resp, ok := <-respCh:
+			if !ok {
+				return
+			}
 			tr := &tunnelResponse{
 				Status:     resp.Status,
 				Headers:    resp.Headers,
@@ -1082,7 +1130,7 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 	if publishTimeout <= 0 {
 		publishTimeout = tunnelBusPublishTimeout
 	}
-	publishCtx, publishCancel := context.WithTimeout(context.Background(), publishTimeout)
+	publishCtx, publishCancel := context.WithTimeout(ctx, publishTimeout)
 	defer publishCancel()
 	if err := h.bus.PublishTunnelRequest(publishCtx, routeID, busReq); err != nil {
 		cancel()
@@ -1126,8 +1174,8 @@ func (h *Handler) renewTunnelLeases(tc *tunnelConn) {
 	h.mu.RUnlock()
 
 	for _, routeID := range routeIDs {
-		if _, renewed, err := h.store.RenewRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil {
-			log.Printf("[tunnel] lease_renew_failed route=%s err=%v", routeID, err)
+		if _, renewed, err := h.store.RenewRouteLease(tc.ctx, routeID, h.nodeID, routeLeaseTTL); err != nil {
+			slog.Warn("lease renew failed", "route", routeID, "err", err)
 			continue
 		} else if !renewed {
 			h.handleLostTunnelLease(tc, routeID)
@@ -1149,19 +1197,17 @@ func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
 		return
 	}
 	delete(tc.activatedRoutes, routeID)
-	stop := tc.routeBusUnsubs[routeID]
-	delete(tc.routeBusUnsubs, routeID)
+	rs := tc.routeBusSubs[routeID]
+	delete(tc.routeBusSubs, routeID)
 	h.mu.Unlock()
-	if stop != nil {
-		stop()
-	}
+	rs.stop()
 
-	activeDeviceID, active, err := h.store.GetActiveRouteDevice(context.Background(), routeID)
+	activeDeviceID, active, err := h.store.GetActiveRouteDevice(tc.ctx, routeID)
 	if err == nil && active && activeDeviceID == tc.deviceID {
-		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+		_ = h.store.DeleteActiveRoute(tc.ctx, routeID)
 	}
-	if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "inactive", now, false); err != nil {
-		log.Printf("[tunnel] failed to persist lost-lease route=%s: %v", routeID, err)
+	if err := h.setTunnelRouteStatus(tc.ctx, routeID, tc.deviceID, "inactive", now, false); err != nil {
+		slog.Warn("failed to persist lost-lease", "route", routeID, "err", err)
 	}
 
 	if tc.conn != nil {
@@ -1174,8 +1220,8 @@ func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
 	}
 }
 
-func (h *Handler) setTunnelRouteStatus(routeID, expectedDeviceID, nextStatus, updatedAt string, strict bool) error {
-	_, err := h.store.UpdateIntegrationRoute(context.Background(), routeID, func(route *integrationRoute) error {
+func (h *Handler) setTunnelRouteStatus(ctx context.Context, routeID, expectedDeviceID, nextStatus, updatedAt string, strict bool) error {
+	_, err := h.store.UpdateIntegrationRoute(ctx, routeID, func(route *integrationRoute) error {
 		if route == nil {
 			return ErrRouteNotFound
 		}
@@ -1214,7 +1260,7 @@ func (h *Handler) startInflightSweeper() {
 				pruned := h.pruneStaleInflightRequestsLocked(now.UTC())
 				h.mu.Unlock()
 				if pruned > 0 {
-					log.Printf("[tunnel] pruned_stale_inflight count=%d", pruned)
+					slog.Info("pruned stale inflight", "count", pruned)
 				}
 			}
 		}
@@ -1223,11 +1269,7 @@ func (h *Handler) startInflightSweeper() {
 
 func (h *Handler) removeInflightRequestsForDeviceLocked(deviceID string) {
 	for requestID, inflight := range h.inflightRequests {
-		if inflight == nil {
-			h.dropInflightRequestLocked(requestID, inflight)
-			continue
-		}
-		if inflight.deviceID == deviceID {
+		if inflight != nil && inflight.deviceID == deviceID {
 			h.dropInflightRequestLocked(requestID, inflight)
 		}
 	}

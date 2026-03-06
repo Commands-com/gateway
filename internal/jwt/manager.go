@@ -2,6 +2,7 @@ package jwt
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -32,10 +33,22 @@ func NewManager(signingSecret, issuer, audience string) (*Manager, error) {
 	if secret == "" {
 		return nil, fmt.Errorf("signing secret cannot be empty")
 	}
-	sum := sha256.Sum256([]byte(secret))
-	privateKey := ed25519.NewKeyFromSeed(sum[:])
+	// Derive Ed25519 seed using HKDF (RFC 5869) for proper key stretching.
+	// STABILITY: changing the salt, info, or algorithm below will invalidate
+	// every previously-issued JWT. See TestKeyDerivationStability.
+	// HKDF-Extract: PRK = HMAC-SHA256(salt, secret)
+	extractor := hmac.New(sha256.New, []byte("oss-commands-gateway"))
+	extractor.Write([]byte(secret))
+	prk := extractor.Sum(nil)
+	// HKDF-Expand: seed = HMAC-SHA256(PRK, info || 0x01)
+	expander := hmac.New(sha256.New, prk)
+	expander.Write([]byte("ed25519-signing-key-v1"))
+	expander.Write([]byte{0x01})
+	seed := expander.Sum(nil)
+	privateKey := ed25519.NewKeyFromSeed(seed)
 	publicKey := privateKey.Public().(ed25519.PublicKey)
-	kid := base64.RawURLEncoding.EncodeToString(sum[:8])
+	kidHash := sha256.Sum256(publicKey)
+	kid := base64.RawURLEncoding.EncodeToString(kidHash[:8])
 	return &Manager{
 		privateKey: privateKey,
 		publicKey:  publicKey,

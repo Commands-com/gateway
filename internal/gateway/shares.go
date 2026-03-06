@@ -258,7 +258,7 @@ func (h *Handler) RevokeShareGrant(c fiber.Ctx) error {
 
 	// Proactively evict any open SSE streams for the revoked grantee
 	if grant.GranteeUID != "" {
-		h.evictSubscribersByUID(grant.GranteeUID, grant.DeviceID)
+		h.evictSubscribersByUID(c.Context(), grant.GranteeUID, grant.DeviceID)
 	}
 
 	return c.JSON(fiber.Map{"grantId": grantID, "status": "revoked"})
@@ -304,7 +304,7 @@ func (h *Handler) LeaveShareGrant(c fiber.Ctx) error {
 
 	// Proactively evict any open SSE streams for the leaving grantee
 	if grant.GranteeUID != "" {
-		h.evictSubscribersByUID(grant.GranteeUID, grant.DeviceID)
+		h.evictSubscribersByUID(c.Context(), grant.GranteeUID, grant.DeviceID)
 	}
 
 	return c.JSON(fiber.Map{"grantId": grantID, "status": "revoked"})

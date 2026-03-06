@@ -42,6 +42,11 @@ type MessageBus interface {
 
 	PublishTunnelResponse(ctx context.Context, requestID string, resp TunnelResponseMessage) error
 	SubscribeTunnelResponses(ctx context.Context, requestID string, ch chan<- TunnelResponseMessage) (unsubscribe func(), err error)
+
+	// PublishDeviceEvent broadcasts a device state change (connect/disconnect)
+	// so all nodes can wake their device SSE streams.
+	PublishDeviceEvent(ctx context.Context) error
+	SubscribeDeviceEvents(ctx context.Context, ch chan<- struct{}) (unsubscribe func(), err error)
 }
 
 var (
@@ -55,6 +60,7 @@ type InMemoryMessageBus struct {
 	sessionSubs map[string]map[chan<- sessionEvent]struct{}
 	tunnelReq   map[string]map[chan<- TunnelRequestMessage]struct{}
 	tunnelResp  map[string]map[chan<- TunnelResponseMessage]struct{}
+	deviceSubs  map[chan<- struct{}]struct{}
 }
 
 func NewInMemoryMessageBus() *InMemoryMessageBus {
@@ -62,15 +68,23 @@ func NewInMemoryMessageBus() *InMemoryMessageBus {
 		sessionSubs: make(map[string]map[chan<- sessionEvent]struct{}),
 		tunnelReq:   make(map[string]map[chan<- TunnelRequestMessage]struct{}),
 		tunnelResp:  make(map[string]map[chan<- TunnelResponseMessage]struct{}),
+		deviceSubs:  make(map[chan<- struct{}]struct{}),
 	}
 }
 
-func (b *InMemoryMessageBus) PublishSessionEvent(_ context.Context, sessionID string, event sessionEvent) error {
+func (b *InMemoryMessageBus) PublishSessionEvent(ctx context.Context, sessionID string, event sessionEvent) error {
 	subs := b.snapshotSessionSubs(sessionID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, ch := range subs {
 		select {
 		case ch <- event:
-		default:
+		case <-ctx.Done():
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("%w: %v", ErrMessageBusBackpressure, err)
+			}
+			return ErrMessageBusBackpressure
 		}
 	}
 	return nil
@@ -118,6 +132,34 @@ func (b *InMemoryMessageBus) PublishTunnelResponse(_ context.Context, requestID 
 
 func (b *InMemoryMessageBus) SubscribeTunnelResponses(ctx context.Context, requestID string, ch chan<- TunnelResponseMessage) (func(), error) {
 	return b.subscribeTunnelResp(ctx, requestID, ch), nil
+}
+
+func (b *InMemoryMessageBus) PublishDeviceEvent(_ context.Context) error {
+	b.mu.RLock()
+	subs := make([]chan<- struct{}, 0, len(b.deviceSubs))
+	for ch := range b.deviceSubs {
+		subs = append(subs, ch)
+	}
+	b.mu.RUnlock()
+	for _, ch := range subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (b *InMemoryMessageBus) SubscribeDeviceEvents(ctx context.Context, ch chan<- struct{}) (func(), error) {
+	b.mu.Lock()
+	b.deviceSubs[ch] = struct{}{}
+	b.mu.Unlock()
+	unsub := b.makeUnsubscribe(ctx, func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		delete(b.deviceSubs, ch)
+	})
+	return unsub, nil
 }
 
 func (b *InMemoryMessageBus) subscribeSession(ctx context.Context, sessionID string, ch chan<- sessionEvent) func() {

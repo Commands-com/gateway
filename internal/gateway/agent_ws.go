@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +24,8 @@ type agentConn struct {
 	ownerUID         string
 	connID           string
 	conn             *websocket.Conn
+	ctx              context.Context
+	cancel           context.CancelFunc
 	connectedAt      time.Time
 	lastSeenAt       time.Time
 	lastTransportSeq int
@@ -128,11 +130,14 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 
 	now := time.Now().UTC()
 	connID := fmt.Sprintf("agt:%d", atomic.AddUint64(&wsConnIDCounter, 1))
+	connCtx, connCancel := context.WithCancel(context.Background())
 	state := &agentConn{
 		deviceID:         deviceID,
 		ownerUID:         ownerUID,
 		connID:           connID,
 		conn:             c,
+		ctx:              connCtx,
+		cancel:           connCancel,
 		connectedAt:      now,
 		lastSeenAt:       now,
 		lastTransportSeq: 0,
@@ -165,6 +170,11 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 	h.agentConnCountByOwner[ownerUID]++
 	h.mu.Unlock()
 
+	if err := h.store.SetDeviceOnline(connCtx, deviceID, h.nodeID, now, presenceTTL); err != nil {
+		slog.Warn("presence online failed", "device", deviceID, "err", err)
+	}
+	h.notifyDeviceStateChange()
+
 	if replaced != nil && replaced != state {
 		replaced.closeWithMessage(websocket.CloseNormalClosure, "replaced_by_new_connection")
 	}
@@ -186,19 +196,52 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 		}); err != nil {
 			// Clean up agent state on init write failure to avoid memory leak
 			h.mu.Lock()
+			removed := false
 			if current, ok := h.agents[deviceID]; ok && current == state {
 				delete(h.agents, deviceID)
 				h.agentConnCountByOwner[ownerUID]--
 				if h.agentConnCountByOwner[ownerUID] <= 0 {
 					delete(h.agentConnCountByOwner, ownerUID)
 				}
+				removed = true
 			}
 			h.mu.Unlock()
+			if removed {
+				offCtx, offCancel := context.WithTimeout(context.Background(), presenceStoreTimeout)
+				if err := h.store.SetDeviceOffline(offCtx, deviceID, h.nodeID); err != nil {
+					slog.Warn("presence offline failed", "device", deviceID, "err", err)
+				}
+				offCancel()
+				h.notifyDeviceStateChange()
+			}
 			_ = c.Close()
 			return
 		}
 	}
-	h.flushPendingHandshakes(deviceID)
+	h.flushPendingHandshakes(connCtx, deviceID)
+
+	// Presence heartbeat: periodically renews the TTL in the store and
+	// flushes a debounced LastSeenAt update.
+	stopPresence := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(presenceRenewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPresence:
+				return
+			case <-h.done:
+				return
+			case t := <-ticker.C:
+				now := t.UTC()
+				ctx, cancel := context.WithTimeout(context.Background(), presenceStoreTimeout)
+				if err := h.store.TouchDevicePresence(ctx, deviceID, h.nodeID, now, presenceTTL); err != nil {
+					slog.Warn("presence renew failed", "device", deviceID, "err", err)
+				}
+				cancel()
+			}
+		}
+	}()
 
 	_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
 	c.SetPongHandler(func(string) error {
@@ -206,6 +249,7 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 		return nil
 	})
 
+	var lastSeenFlushed time.Time
 	for {
 		messageType, payload, err := c.ReadMessage()
 		if err != nil {
@@ -213,31 +257,55 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 		}
 
 		_ = c.SetReadDeadline(time.Now().Add(wsReadDeadline))
+		nowFrame := time.Now().UTC()
 		h.mu.Lock()
 		if current, ok := h.agents[deviceID]; ok && current == state {
-			current.lastSeenAt = time.Now().UTC()
+			current.lastSeenAt = nowFrame
 		}
 		h.mu.Unlock()
+
+		// Debounced LastSeenAt write to the store.
+		if nowFrame.Sub(lastSeenFlushed) >= presenceLastSeenDebounce {
+			lastSeenFlushed = nowFrame
+			touchCtx, touchCancel := context.WithTimeout(context.Background(), presenceStoreTimeout)
+			if err := h.store.TouchDevicePresence(touchCtx, deviceID, h.nodeID, nowFrame, presenceTTL); err != nil {
+				slog.Warn("presence touch failed", "device", deviceID, "err", err)
+			}
+			touchCancel()
+		}
 
 		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
 			continue
 		}
-		h.handleAgentFrame(deviceID, payload, state)
+		h.handleAgentFrame(connCtx, deviceID, payload, state)
 	}
 
+	connCancel()
+	close(stopPresence)
+
 	h.mu.Lock()
+	wasConnected := false
 	if current, ok := h.agents[deviceID]; ok && current == state {
 		delete(h.agents, deviceID)
 		h.agentConnCountByOwner[ownerUID]--
 		if h.agentConnCountByOwner[ownerUID] <= 0 {
 			delete(h.agentConnCountByOwner, ownerUID)
 		}
+		wasConnected = true
 	}
 	h.mu.Unlock()
 	_ = c.Close()
+	if wasConnected {
+		offCtx, offCancel := context.WithTimeout(context.Background(), presenceStoreTimeout)
+		if err := h.store.SetDeviceOffline(offCtx, deviceID, h.nodeID); err != nil {
+			slog.Warn("presence offline failed", "device", deviceID, "err", err)
+		}
+		offCancel()
+		h.notifyDeviceStateChange()
+	}
 }
 
-func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *agentConn) {
+func (h *Handler) handleAgentFrame(ctx context.Context, deviceID string, payload []byte, connState *agentConn) {
 	var frame map[string]any
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		_ = connState.writeJSON(map[string]any{"type": "agent.error", "error": "invalid_json"})
@@ -261,7 +329,7 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 	}
 
 	if violation := h.validateAndAdvanceTransportFrame(deviceID, connState, frame); violation != "" {
-		log.Printf("[gateway] transport_rejected device=%s conn=%s violation=%s", deviceID, connState.connID, violation)
+		slog.Warn("transport rejected", "device", deviceID, "conn", connState.connID, "violation", violation)
 		return
 	}
 	delete(frame, "transport_token")
@@ -274,7 +342,7 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 		return
 	}
 
-	if frameType != "session.handshake.ack" && !h.hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID) {
+	if frameType != "session.handshake.ack" && !h.hasCompletedHandshakeBinding(ctx, sessionID, deviceID, handshakeID) {
 		_ = connState.writeJSON(map[string]any{
 			"type":         "agent.error",
 			"error":        "unauthorized_session_frame",
@@ -285,13 +353,13 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 	}
 
 	if frameType == "session.handshake.ack" {
-		if !h.processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID, frame) {
+		if !h.processAgentHandshakeAckFrame(ctx, deviceID, sessionID, handshakeID, frame) {
 			return
 		}
 	}
 
 	if encryptedSessionFrameTypes[frameType] {
-		state, found, err := h.store.GetSession(context.Background(), sessionID)
+		state, found, err := h.store.GetSession(ctx, sessionID)
 		if err != nil || !found || state == nil {
 			return
 		}
@@ -307,24 +375,24 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 			frame["conversation_id"] = state.ConversationID
 		}
 		if violation := validateEncryptedEnvelope(frame); violation != "" {
-			_, _ = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			_, _ = h.store.UpdateSession(ctx, sessionID, func(sess *sessionState) error {
 				if sess.DeviceID != deviceID {
 					return nil
 				}
 				sess.UpdatedAt = nowUnix
 				return nil
 			})
-			log.Printf("[gateway] encryption_violation dir=agent_to_client device=%s session=%s frame=%s violation=%s", deviceID, sessionID, frameType, violation)
+			slog.Warn("encryption violation", "dir", "agent_to_client", "device", deviceID, "session", sessionID, "frame", frameType, "violation", violation)
 			if h.cfg.RequireEncryptedFrames {
 				return
 			}
 		} else {
 			seq, _ := extractPositiveInt(frame, "seq")
 			if seq <= state.SeqAgentToClient {
-				log.Printf("[gateway] replay_rejected dir=agent_to_client device=%s session=%s frame=%s seq=%d", deviceID, sessionID, frameType, seq)
+				slog.Warn("replay rejected", "dir", "agent_to_client", "device", deviceID, "session", sessionID, "frame", frameType, "seq", seq)
 				return
 			}
-			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			updated, err := h.store.UpdateSession(ctx, sessionID, func(sess *sessionState) error {
 				if sess.DeviceID != deviceID {
 					return nil
 				}
@@ -339,14 +407,14 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 				return nil
 			})
 			if err != nil || updated == nil {
-				log.Printf("[gateway] replay_rejected dir=agent_to_client device=%s session=%s frame=%s seq=%d", deviceID, sessionID, frameType, seq)
+				slog.Warn("replay rejected", "dir", "agent_to_client", "device", deviceID, "session", sessionID, "frame", frameType, "seq", seq)
 				return
 			}
 		}
 	}
 
 	if strings.TrimSpace(firstStringMap(frame, "conversation_id", "conversationId")) == "" {
-		state, found, err := h.store.GetSession(context.Background(), sessionID)
+		state, found, err := h.store.GetSession(ctx, sessionID)
 		if err == nil && found && state != nil {
 			if state.ConversationID != "" {
 				frame["conversation_id"] = state.ConversationID
@@ -358,15 +426,15 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 	if err != nil {
 		return
 	}
-	h.appendSessionEvent(sessionID, raw)
+	h.appendSessionEvent(ctx, sessionID, raw)
 }
 
-func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID string, frame map[string]any) bool {
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+func (h *Handler) processAgentHandshakeAckFrame(ctx context.Context, deviceID, sessionID, handshakeID string, frame map[string]any) bool {
+	state, found, err := h.store.GetSession(ctx, sessionID)
 	if err != nil || !found || state == nil {
 		return false
 	}
-	device, hasDevice, err := h.store.GetDevice(context.Background(), deviceID)
+	device, hasDevice, err := h.store.GetDevice(ctx, deviceID)
 	if err != nil {
 		return false
 	}
@@ -394,6 +462,7 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 	newTranscriptHash := state.TranscriptHash
 
 	if strings.TrimSpace(firstStringMap(frame, "status")) == "error" {
+		// Flat key fallback: try frame["error"], then frame["details"], then frame["message"].
 		lastErr := strings.TrimSpace(firstStringMap(frame, "error", "details", "message"))
 		if lastErr == "" {
 			lastErr = "agent handshake error"
@@ -402,7 +471,7 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 		newLastError = lastErr
 		frame["status"] = "agent_error"
 		frame["error"] = lastErr
-		_, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		_, err := h.store.UpdateSession(ctx, sessionID, func(sess *sessionState) error {
 			if sess.DeviceID != deviceID {
 				return fmt.Errorf("device_mismatch")
 			}
@@ -453,7 +522,7 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 		newLastError = lastErr
 		frame["status"] = "agent_error"
 		frame["error"] = lastErr
-		_, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		_, err := h.store.UpdateSession(ctx, sessionID, func(sess *sessionState) error {
 			if sess.DeviceID != deviceID {
 				return fmt.Errorf("device_mismatch")
 			}
@@ -474,7 +543,7 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 	newAgentSignature = agentSignature
 	newTranscriptHash = transcriptHash
 
-	updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+	updated, err := h.store.UpdateSession(ctx, sessionID, func(sess *sessionState) error {
 		if sess.DeviceID != deviceID {
 			return fmt.Errorf("device_mismatch")
 		}
@@ -503,8 +572,8 @@ func (h *Handler) processAgentHandshakeAckFrame(deviceID, sessionID, handshakeID
 	return true
 }
 
-func (h *Handler) hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID string) bool {
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+func (h *Handler) hasCompletedHandshakeBinding(ctx context.Context, sessionID, deviceID, handshakeID string) bool {
+	state, found, err := h.store.GetSession(ctx, sessionID)
 	if err != nil || !found || state == nil {
 		return false
 	}
@@ -517,13 +586,13 @@ func (h *Handler) hasCompletedHandshakeBinding(sessionID, deviceID, handshakeID 
 	return state.Status == "agent_acknowledged"
 }
 
-func (h *Handler) flushPendingHandshakes(deviceID string) {
+func (h *Handler) flushPendingHandshakes(ctx context.Context, deviceID string) {
 	type pendingHandshake struct {
 		sessionID string
 	}
 	pending := make([]pendingHandshake, 0)
 
-	sessions, err := h.store.ListSessionsByDevice(context.Background(), deviceID)
+	sessions, err := h.store.ListSessionsByDevice(ctx, deviceID)
 	if err != nil {
 		return
 	}
@@ -537,7 +606,7 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 	}
 
 	for _, p := range pending {
-		state, found, err := h.store.GetSession(context.Background(), p.sessionID)
+		state, found, err := h.store.GetSession(ctx, p.sessionID)
 		if err != nil || !found || state == nil {
 			continue
 		}
@@ -548,12 +617,12 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 
 		newStatus := "pending_agent_ack"
 		newError := ""
-		if err := h.sendToAgentForSession(p.sessionID, frame); err != nil {
+		if err := h.sendToAgentForSession(ctx, p.sessionID, frame); err != nil {
 			newStatus = "pending_agent_connection"
 			newError = err.Error()
 		}
 
-		_, _ = h.store.UpdateSession(context.Background(), p.sessionID, func(sess *sessionState) error {
+		_, _ = h.store.UpdateSession(ctx, p.sessionID, func(sess *sessionState) error {
 			if sess.DeviceID != deviceID {
 				return nil
 			}
@@ -565,8 +634,8 @@ func (h *Handler) flushPendingHandshakes(deviceID string) {
 	}
 }
 
-func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any) error {
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+func (h *Handler) sendToAgentForSession(ctx context.Context, sessionID string, payload map[string]any) error {
+	state, found, err := h.store.GetSession(ctx, sessionID)
 	if err != nil || !found || state == nil {
 		return fmt.Errorf("session_not_found")
 	}
@@ -588,15 +657,25 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 	}
 	if err := writeFn(conn, payload); err != nil {
 		h.mu.Lock()
+		evicted := false
 		if current, ok := h.agents[deviceID]; ok && current == conn {
 			delete(h.agents, deviceID)
 			h.agentConnCountByOwner[current.ownerUID]--
 			if h.agentConnCountByOwner[current.ownerUID] <= 0 {
 				delete(h.agentConnCountByOwner, current.ownerUID)
 			}
+			evicted = true
 		}
 		h.mu.Unlock()
 		_ = conn.conn.Close()
+		if evicted {
+			offCtx, offCancel := context.WithTimeout(context.Background(), presenceStoreTimeout)
+			if err := h.store.SetDeviceOffline(offCtx, deviceID, h.nodeID); err != nil {
+				slog.Warn("presence offline failed", "device", deviceID, "err", err)
+			}
+			offCancel()
+			h.notifyDeviceStateChange()
+		}
 		return fmt.Errorf("agent_unavailable")
 	}
 	return nil

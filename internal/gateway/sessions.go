@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -72,7 +73,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	if !exists {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
-	if !h.canAccessDeviceForPrincipal(principal.UID, principal.Email, deviceID) {
+	if !h.canAccessDeviceForPrincipal(c.Context(), principal.UID, principal.Email, deviceID) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -144,7 +145,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 
 	if status != "agent_acknowledged" {
 		frame := h.buildHandshakeRequestFrame(state)
-		if err := h.sendToAgentForSession(sessionID, frame); err != nil {
+		if err := h.sendToAgentForSession(c.Context(), sessionID, frame); err != nil {
 			relayStatus = "pending_agent_connection"
 			relayError = err.Error()
 			updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
@@ -220,7 +221,7 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
 
-	if !h.isSessionMemberDynamic(principal.UID, state) {
+	if !h.isSessionMemberDynamic(c.Context(), principal.UID, state) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -234,7 +235,7 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 	if (status == "pending_agent_ack" || status == "pending_agent_connection") && time.Since(time.Unix(lastUpdatedAt, 0)) >= handshakeRetryInterval {
 		newStatus := "pending_agent_ack"
 		newError := ""
-		if err := h.sendToAgentForSession(sessionID, frame); err != nil {
+		if err := h.sendToAgentForSession(c.Context(), sessionID, frame); err != nil {
 			newStatus = "pending_agent_connection"
 			newError = err.Error()
 		}
@@ -412,7 +413,7 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 
 	// appendSessionEvent acquires h.mu.
 	raw, _ := json.Marshal(event)
-	h.appendSessionEvent(sessionID, raw)
+	h.appendSessionEvent(c.Context(), sessionID, raw)
 
 	return c.Status(fiber.StatusAccepted).JSON(resp)
 }
@@ -448,7 +449,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
 
-	if !h.isSessionMemberDynamic(principal.UID, state) {
+	if !h.isSessionMemberDynamic(c.Context(), principal.UID, state) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -501,7 +502,11 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
-	if !h.checkAndReserveIdempotencyKey(sessionID, principal.UID, idempotencyKey, now) {
+	reserved, idempErr := h.checkAndReserveIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey)
+	if idempErr != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check idempotency key"})
+	}
+	if !reserved {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error":      "duplicate_request",
 			"session_id": sessionID,
@@ -566,7 +571,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		reservedSeq = seq
 	}
 
-	if err := h.sendToAgentForSession(sessionID, payload); err != nil {
+	if err := h.sendToAgentForSession(c.Context(), sessionID, payload); err != nil {
 		if reservedSeq > 0 {
 			_, _ = h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 				if sess.SeqClientToAgent == reservedSeq {
@@ -577,7 +582,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 			})
 		}
 		// Rollback the idempotency reservation so the client can retry
-		h.releaseIdempotencyKey(sessionID, principal.UID, idempotencyKey)
+		h.releaseIdempotencyKey(c.Context(), sessionID, principal.UID, idempotencyKey)
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 			"error":           "agent_unavailable",
 			"session_id":      sessionID,
@@ -616,13 +621,14 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 	if !found {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "session not found"})
 	}
-	if !h.isSessionMemberDynamic(principal.UID, state) {
+	if !h.isSessionMemberDynamic(c.Context(), principal.UID, state) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
 	// Subscribe before replay to avoid missing events in the gap
+	ctx := c.Context()
 	sub := h.subscribe(sessionID, principal.UID)
-	replay := h.replayEvents(sessionID, lastEventID)
+	replay := h.replayEvents(ctx, sessionID, lastEventID)
 
 	c.Set(fiber.HeaderContentType, "text/event-stream")
 	c.Set(fiber.HeaderCacheControl, "no-cache")
@@ -682,8 +688,14 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 				}
 				lastSentID = evt.ID
 			case <-heartbeat.C:
-				// Re-check authorization on each heartbeat
-				if !h.isSessionMemberDynamic(principal.UID, state) {
+				// Re-fetch session state so authorization checks reflect
+				// current ownership and grant state rather than the snapshot
+				// captured at subscription time.
+				freshState, found, err := h.store.GetSession(ctx, sessionID)
+				if err != nil || !found {
+					return
+				}
+				if !h.isSessionMemberDynamic(ctx, principal.UID, freshState) {
 					_ = writeSSEComment(w, "authorization_revoked")
 					return
 				}
@@ -720,7 +732,7 @@ func newSessionMessageID() string {
 // isSessionMemberDynamic checks whether the given UID currently has access to the session
 // by evaluating device ownership and current grant state dynamically.
 // Must be called without holding h.mu.
-func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
+func (h *Handler) isSessionMemberDynamic(ctx context.Context, uid string, state *sessionState) bool {
 	if state == nil {
 		return false
 	}
@@ -734,5 +746,5 @@ func (h *Handler) isSessionMemberDynamic(uid string, state *sessionState) bool {
 	}
 
 	now := time.Now().UTC().Unix()
-	return h.hasActiveGrant(deviceID, uid, now)
+	return h.hasActiveGrant(ctx, deviceID, uid, now)
 }

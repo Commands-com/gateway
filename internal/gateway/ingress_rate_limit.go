@@ -83,6 +83,12 @@ type IngressRateLimiter struct {
 	byRoute *fixedWindowLimiter
 }
 
+// OAuthRateLimiter applies per-IP rate limiting to OAuth endpoints.
+type OAuthRateLimiter struct {
+	window time.Duration
+	byIP   *fixedWindowLimiter
+}
+
 func NewIngressRateLimiter(globalLimit, ipLimit, routeLimit int, window time.Duration) *IngressRateLimiter {
 	if window <= 0 {
 		window = time.Minute
@@ -127,5 +133,26 @@ func (l *IngressRateLimiter) RouteMiddleware() fiber.Handler {
 		}
 		c.Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
 		return c.SendStatus(fiber.StatusTooManyRequests)
+	}
+}
+
+func NewOAuthRateLimiter(ipLimit int, window time.Duration) *OAuthRateLimiter {
+	if window <= 0 {
+		window = time.Minute
+	}
+	return &OAuthRateLimiter{
+		window: window,
+		byIP:   newFixedWindowLimiter(ipLimit, window),
+	}
+}
+
+func (l *OAuthRateLimiter) Middleware() fiber.Handler {
+	return func(c fiber.Ctx) error {
+		key := strings.TrimSpace(c.IP())
+		if l.byIP.Allow(key, time.Now().UTC()) {
+			return c.Next()
+		}
+		c.Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too_many_requests"})
 	}
 }

@@ -42,9 +42,13 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 		t.Fatalf("expected route_id and route_token in create response")
 	}
 
+	tcCtx, tcCancel := context.WithCancel(context.Background())
+	defer tcCancel()
 	tc := &tunnelConn{
 		deviceID:        "devowner1",
 		ownerUID:        "owner1",
+		ctx:             tcCtx,
+		cancel:          tcCancel,
 		activatedRoutes: map[string]bool{routeID: true},
 	}
 	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
@@ -71,7 +75,7 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 
 	h.tunnelWriteFn = func(conn *tunnelConn, frame map[string]any) error {
 		requestID := firstStringMap(frame, "request_id")
-		h.handleTunnelResponse(conn, map[string]any{
+		h.handleTunnelResponse(context.Background(), conn, map[string]any{
 			"type":       "tunnel.response",
 			"request_id": requestID,
 			"status":     201,
@@ -175,9 +179,13 @@ func TestIngressRejectsWhenLeaseOwnedByRemoteNode(t *testing.T) {
 		t.Fatalf("expected route_id and route_token in create response")
 	}
 
+	tcCtx, tcCancel := context.WithCancel(context.Background())
+	defer tcCancel()
 	tc := &tunnelConn{
 		deviceID:        "devowner1",
 		ownerUID:        "owner1",
+		ctx:             tcCtx,
+		cancel:          tcCancel,
 		activatedRoutes: map[string]bool{routeID: true},
 	}
 	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
@@ -278,9 +286,13 @@ func TestUpdateIntegrationRouteConflictDoesNotDeactivateTunnelState(t *testing.T
 		t.Fatalf("expected route lease claim to succeed, err=%v", err)
 	}
 
+	tcCtx, tcCancel := context.WithCancel(context.Background())
+	defer tcCancel()
 	tc := &tunnelConn{
 		deviceID:        "devowner1",
 		ownerUID:        "owner1",
+		ctx:             tcCtx,
+		cancel:          tcCancel,
 		activatedRoutes: map[string]bool{routeID: true},
 	}
 	h.mu.Lock()
@@ -340,9 +352,13 @@ func TestTunnelLeaseRenewalDropsLostRoute(t *testing.T) {
 		t.Fatalf("expected route_id in create response")
 	}
 
+	tcCtx, tcCancel := context.WithCancel(context.Background())
+	defer tcCancel()
 	tc := &tunnelConn{
 		deviceID:        "devowner1",
 		ownerUID:        "owner1",
+		ctx:             tcCtx,
+		cancel:          tcCancel,
 		activatedRoutes: map[string]bool{routeID: true},
 	}
 	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
@@ -415,7 +431,7 @@ func TestSetTunnelRouteStatusGuardsTerminalAndDeviceMismatch(t *testing.T) {
 		t.Fatalf("save route failed: %v", err)
 	}
 
-	if err := h.setTunnelRouteStatus(routeID, "different-device", "inactive", now, false); err != nil {
+	if err := h.setTunnelRouteStatus(context.Background(), routeID, "different-device", "inactive", now, false); err != nil {
 		t.Fatalf("unexpected error for mismatched-device transition: %v", err)
 	}
 	stored, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
@@ -432,7 +448,7 @@ func TestSetTunnelRouteStatusGuardsTerminalAndDeviceMismatch(t *testing.T) {
 		t.Fatalf("save revoked route failed: %v", err)
 	}
 
-	if err := h.setTunnelRouteStatus(routeID, "devowner1", "provisioned", now, false); err != nil {
+	if err := h.setTunnelRouteStatus(context.Background(), routeID, "devowner1", "provisioned", now, false); err != nil {
 		t.Fatalf("unexpected error for revoked transition: %v", err)
 	}
 	stored, found, err = h.store.GetIntegrationRoute(context.Background(), routeID)
@@ -443,7 +459,7 @@ func TestSetTunnelRouteStatusGuardsTerminalAndDeviceMismatch(t *testing.T) {
 		t.Fatalf("expected revoked status to be preserved, got %s", stored.Status)
 	}
 
-	err = h.setTunnelRouteStatus(routeID, "devowner1", "active", now, true)
+	err = h.setTunnelRouteStatus(context.Background(), routeID, "devowner1", "active", now, true)
 	if !errors.Is(err, errRouteStatusUpdateSkipped) {
 		t.Fatalf("expected strict transition to fail for revoked route, got %v", err)
 	}

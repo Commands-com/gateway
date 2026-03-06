@@ -55,11 +55,11 @@ func effectiveGrantStatus(grant *shareGrant, now int64) string {
 
 // hasActiveGrant reports whether uid has an active grant for deviceID.
 // Must be called without holding h.mu (the store handles its own concurrency).
-func (h *Handler) hasActiveGrant(deviceID, uid string, now int64) bool {
+func (h *Handler) hasActiveGrant(ctx context.Context, deviceID, uid string, now int64) bool {
 	if deviceID == "" || uid == "" {
 		return false
 	}
-	grants, err := h.store.ListShareGrantsByDevice(context.Background(), deviceID)
+	grants, err := h.store.ListShareGrantsByDevice(ctx, deviceID)
 	if err != nil {
 		return false
 	}

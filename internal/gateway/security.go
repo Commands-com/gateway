@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,7 +9,7 @@ import (
 )
 
 const (
-	idempotencySweepInterval = 1 * time.Minute
+	defaultIdempotencyTTL = 5 * time.Minute
 )
 
 var encryptedSessionFrameTypes = map[string]bool{
@@ -68,53 +69,18 @@ func extractPositiveInt(frame map[string]any, key string) (int, bool) {
 	}
 }
 
-func (h *Handler) startIdempotencySweeper() {
-	go func() {
-		ticker := time.NewTicker(idempotencySweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-h.done:
-				return
-			case now := <-ticker.C:
-				h.idempotencyMu.Lock()
-				h.pruneIdempotencyKeysLocked(now.UTC())
-				h.idempotencyMu.Unlock()
-			}
-		}
-	}()
-}
-
-func (h *Handler) pruneIdempotencyKeysLocked(now time.Time) {
-	for key, expiry := range h.idempotencyKeys {
-		if now.After(expiry) {
-			delete(h.idempotencyKeys, key)
-		}
-	}
-}
-
-func (h *Handler) checkAndReserveIdempotencyKey(sessionID, requesterUID, idempotencyKey string, now time.Time) bool {
-	h.idempotencyMu.Lock()
-	defer h.idempotencyMu.Unlock()
-	h.pruneIdempotencyKeysLocked(now)
-
+func (h *Handler) checkAndReserveIdempotencyKey(ctx context.Context, sessionID, requesterUID, idempotencyKey string) (bool, error) {
 	compound := fmt.Sprintf("%s:%s:%s", sessionID, requesterUID, idempotencyKey)
-	if expiry, exists := h.idempotencyKeys[compound]; exists && now.Before(expiry) {
-		return false
-	}
 	ttl := time.Duration(h.cfg.IdempotencyTTLSeconds) * time.Second
 	if ttl <= 0 {
-		ttl = 5 * time.Minute
+		ttl = defaultIdempotencyTTL
 	}
-	h.idempotencyKeys[compound] = now.Add(ttl)
-	return true
+	return h.store.CheckAndReserveIdempotencyKey(ctx, compound, ttl)
 }
 
-func (h *Handler) releaseIdempotencyKey(sessionID, requesterUID, idempotencyKey string) {
-	h.idempotencyMu.Lock()
-	defer h.idempotencyMu.Unlock()
+func (h *Handler) releaseIdempotencyKey(ctx context.Context, sessionID, requesterUID, idempotencyKey string) {
 	compound := fmt.Sprintf("%s:%s:%s", sessionID, requesterUID, idempotencyKey)
-	delete(h.idempotencyKeys, compound)
+	_ = h.store.ReleaseIdempotencyKey(ctx, compound)
 }
 
 func (h *Handler) validateAndAdvanceTransportFrame(deviceID string, connState *agentConn, frame map[string]any) string {

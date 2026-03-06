@@ -3,7 +3,7 @@ package gateway
 import (
 	"encoding/base64"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -59,7 +59,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	}
 
 	if err := h.store.TouchIntegrationRouteLastUsed(c.Context(), routeID, now.Format(time.RFC3339)); err != nil {
-		log.Printf("[ingress] route_touch_failed route=%s: %v", routeID, err)
+		slog.Warn("route touch failed", "route", routeID, "err", err)
 	}
 
 	headers := make([][]string, 0)
@@ -106,9 +106,9 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		"deadline_ms":       routeCopy.DeadlineMs,
 	}
 
-	inflight, err := h.sendTunnelRequest(routeID, requestFrame)
+	inflight, err := h.sendTunnelRequest(c.Context(), routeID, requestFrame)
 	if err != nil {
-		log.Printf("[ingress] tunnel_send_failed route=%s err=%v", routeID, err)
+		slog.Warn("tunnel send failed", "route", routeID, "err", err)
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
 
@@ -137,7 +137,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		if resp.BodyBase64 != "" {
 			body, err := base64.StdEncoding.DecodeString(resp.BodyBase64)
 			if err != nil {
-				log.Printf("[ingress] body decode failed route=%s request=%s: %v", routeID, requestID, err)
+				slog.Warn("body decode failed", "route", routeID, "request", requestID, "err", err)
 				return c.SendStatus(fiber.StatusBadGateway)
 			}
 			return c.Status(resp.Status).Send(body)
@@ -147,7 +147,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		}
 		return c.SendStatus(resp.Status)
 	case <-timer.C:
-		log.Printf("[ingress] deadline_exceeded route=%s request=%s deadline=%dms", routeID, requestID, routeCopy.DeadlineMs)
+		slog.Warn("deadline exceeded", "route", routeID, "request", requestID, "deadline_ms", routeCopy.DeadlineMs)
 		return c.SendStatus(fiber.StatusGatewayTimeout)
 	}
 }

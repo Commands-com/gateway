@@ -198,6 +198,14 @@ Integrations + webhook tunnel:
 go test ./...
 ```
 
+## CORS Configuration
+
+The default `ALLOW_ORIGINS=*` is suitable for `AUTH_MODE=demo` local development.
+For production deployments using `firebase` or `oidc` auth modes, restrict
+`ALLOW_ORIGINS` to your application's actual origin(s) (e.g.
+`ALLOW_ORIGINS=https://app.example.com`). A wildcard origin disables
+credential support and weakens browser-side request isolation.
+
 ## Notes
 
 - Runtime state is in-memory and single-process.

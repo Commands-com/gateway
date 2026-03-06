@@ -328,7 +328,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 	// Atomic update with version check
 	updated, err := h.store.UpdateIntegrationRoute(c.Context(), routeID, func(r *integrationRoute) error {
 		if r.OwnerUID != principal.UID {
-			return fmt.Errorf("forbidden")
+			return ErrRouteForbidden
 		}
 		if req.DeadlineMs != nil {
 			r.DeadlineMs = *req.DeadlineMs
@@ -359,7 +359,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
 		case errors.Is(err, ErrRouteVersionConflict):
 			return c.Status(fiber.StatusConflict).JSON(integrationErrorResponse("version_conflict", "Route was modified concurrently; please retry", nil))
-		case err.Error() == "forbidden":
+		case errors.Is(err, ErrRouteForbidden):
 			return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 		default:
 			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
@@ -536,7 +536,7 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 	now := time.Now().UTC()
 	updated, err := h.store.UpdateIntegrationRoute(c.Context(), routeID, func(r *integrationRoute) error {
 		if r.OwnerUID != principal.UID {
-			return fmt.Errorf("forbidden")
+			return ErrRouteForbidden
 		}
 		if r.TokenCurrentHash != "" && graceSeconds > 0 {
 			r.TokenPreviousHash = r.TokenCurrentHash
@@ -556,7 +556,7 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 			return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
 		case errors.Is(err, ErrRouteVersionConflict):
 			return c.Status(fiber.StatusConflict).JSON(integrationErrorResponse("version_conflict", "Route was modified concurrently; please retry", nil))
-		case err.Error() == "forbidden":
+		case errors.Is(err, ErrRouteForbidden):
 			return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 		default:
 			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))

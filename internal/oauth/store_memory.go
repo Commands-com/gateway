@@ -1,6 +1,8 @@
 package oauth
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"sync"
 	"time"
 )
@@ -99,22 +101,28 @@ func (s *memoryStore) consumeAuthCode(code string) (authorizationCodeRecord, boo
 	return rec, true
 }
 
+func hashRefreshToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 func (s *memoryStore) putRefreshToken(token string, rec refreshTokenRecord, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec.ExpiresAt = time.Now().UTC().Add(ttl).Unix()
-	s.refreshToken[token] = rec
+	s.refreshToken[hashRefreshToken(token)] = rec
 }
 
 func (s *memoryStore) getRefreshToken(token string) (refreshTokenRecord, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.refreshToken[token]
+	h := hashRefreshToken(token)
+	rec, ok := s.refreshToken[h]
 	if !ok {
 		return refreshTokenRecord{}, false
 	}
 	if rec.ExpiresAt > 0 && time.Now().UTC().Unix() > rec.ExpiresAt {
-		delete(s.refreshToken, token)
+		delete(s.refreshToken, h)
 		return refreshTokenRecord{}, false
 	}
 	return rec, true
@@ -123,5 +131,5 @@ func (s *memoryStore) getRefreshToken(token string) (refreshTokenRecord, bool) {
 func (s *memoryStore) deleteRefreshToken(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.refreshToken, token)
+	delete(s.refreshToken, hashRefreshToken(token))
 }

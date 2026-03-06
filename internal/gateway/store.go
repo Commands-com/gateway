@@ -22,6 +22,7 @@ var (
 	ErrSessionVersionConflict = errors.New("session_version_conflict")
 	ErrRouteNotFound          = errors.New("route_not_found")
 	ErrRouteVersionConflict   = errors.New("route_version_conflict")
+	ErrRouteForbidden         = errors.New("forbidden")
 	ErrInviteNotFound         = errors.New("invite_not_found")
 	ErrInviteGrantNotFound    = errors.New("invite_grant_not_found")
 	ErrInviteExpired          = errors.New("invite_expired")
@@ -42,6 +43,9 @@ type StateStore interface {
 	GetDevice(ctx context.Context, deviceID string) (deviceRecord, bool, error)
 	ListDevices(ctx context.Context) ([]deviceRecord, error)
 	ListDevicesByOwner(ctx context.Context, ownerUID string) ([]deviceRecord, error)
+	SetDeviceOnline(ctx context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error
+	SetDeviceOffline(ctx context.Context, deviceID, nodeID string) error
+	TouchDevicePresence(ctx context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error
 
 	// Sessions
 	CreateSession(ctx context.Context, sess *sessionState) (bool, error)
@@ -49,6 +53,7 @@ type StateStore interface {
 	GetSession(ctx context.Context, sessionID string) (*sessionState, bool, error)
 	UpdateSession(ctx context.Context, sessionID string, mutateFn SessionMutator) (*sessionState, error)
 	ListSessions(ctx context.Context) ([]*sessionState, error)
+	ListStaleSessions(ctx context.Context, updatedBefore int64) ([]*sessionState, error)
 	ListSessionsByDevice(ctx context.Context, deviceID string) ([]*sessionState, error)
 
 	// Share grants and invite token mappings
@@ -91,12 +96,24 @@ type StateStore interface {
 	// Device counting by owner (for limits).
 	CountDevicesByOwner(ctx context.Context, ownerUID string) (int, error)
 
+	// Idempotency keys (distributed dedup for session message POSTs).
+	CheckAndReserveIdempotencyKey(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	ReleaseIdempotencyKey(ctx context.Context, key string) error
+
 	// Metrics / health counters.
 	CountDevices(ctx context.Context) (int, error)
+
 	CountShareGrants(ctx context.Context) (int, error)
 	CountSessions(ctx context.Context) (int, error)
 	CountIntegrationRoutes(ctx context.Context) (int, error)
 	CountSessionEventBacklogs(ctx context.Context) (int, error)
+}
+
+// IdempotencyKeySweeper is an optional interface that StateStore implementations
+// may implement to enable periodic cleanup of expired idempotency keys.
+// Stores with native key expiry (e.g., Redis TTL) do not need this.
+type IdempotencyKeySweeper interface {
+	SweepExpiredIdempotencyKeys(ctx context.Context) error
 }
 
 type InMemoryStateStore struct {
@@ -109,7 +126,8 @@ type InMemoryStateStore struct {
 	allGrantsByDevice  map[string]map[string]struct{} // device→grantIDs (includes revoked)
 	grantsByGrantee    map[string]map[string]struct{}
 	inviteToID         map[string]string
-	sessions       map[string]*sessionState
+	sessions         map[string]*sessionState
+	sessionsByDevice map[string]map[string]struct{}
 
 	integrationRoutes        map[string]*integrationRoute
 	integrationRouteOwnerIDs map[string]map[string]struct{}
@@ -119,6 +137,8 @@ type InMemoryStateStore struct {
 	eventSeq int64
 
 	routeLeases map[string]RouteLease
+
+	idempotencyKeys map[string]time.Time
 }
 
 func NewInMemoryStateStore() *InMemoryStateStore {
@@ -131,11 +151,13 @@ func NewInMemoryStateStore() *InMemoryStateStore {
 		grantsByGrantee:          make(map[string]map[string]struct{}),
 		inviteToID:               make(map[string]string),
 		sessions:                 make(map[string]*sessionState),
+		sessionsByDevice:         make(map[string]map[string]struct{}),
 		integrationRoutes:        make(map[string]*integrationRoute),
 		integrationRouteOwnerIDs: make(map[string]map[string]struct{}),
 		activeRoutes:             make(map[string]string),
 		events:                   make(map[string][]sessionEvent),
 		routeLeases:              make(map[string]RouteLease),
+		idempotencyKeys:          make(map[string]time.Time),
 	}
 }
 
@@ -192,6 +214,57 @@ func (s *InMemoryStateStore) ListDevicesByOwner(_ context.Context, ownerUID stri
 	return out, nil
 }
 
+func (s *InMemoryStateStore) SetDeviceOnline(_ context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dev, ok := s.devices[deviceID]
+	if !ok {
+		return nil
+	}
+	ts := at.Unix()
+	dev.Connected = true
+	dev.ConnectedNodeID = nodeID
+	dev.ConnectedAt = ts
+	dev.LastSeenAt = ts
+	if ttl > 0 {
+		dev.PresenceExpiresAt = at.Add(ttl).Unix()
+	}
+	s.devices[deviceID] = dev
+	return nil
+}
+
+func (s *InMemoryStateStore) SetDeviceOffline(_ context.Context, deviceID, nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dev, ok := s.devices[deviceID]
+	if !ok {
+		return nil
+	}
+	if dev.ConnectedNodeID != nodeID {
+		return nil
+	}
+	dev.Connected = false
+	dev.ConnectedNodeID = ""
+	dev.ConnectedAt = 0
+	s.devices[deviceID] = dev
+	return nil
+}
+
+func (s *InMemoryStateStore) TouchDevicePresence(_ context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dev, ok := s.devices[deviceID]
+	if !ok || !dev.Connected || dev.ConnectedNodeID != nodeID {
+		return nil
+	}
+	dev.LastSeenAt = at.Unix()
+	if ttl > 0 {
+		dev.PresenceExpiresAt = at.Add(ttl).Unix()
+	}
+	s.devices[deviceID] = dev
+	return nil
+}
+
 func (s *InMemoryStateStore) CreateSession(_ context.Context, sess *sessionState) (bool, error) {
 	if sess == nil || sess.SessionID == "" {
 		return false, nil
@@ -206,6 +279,12 @@ func (s *InMemoryStateStore) CreateSession(_ context.Context, sess *sessionState
 		next.Version = 1
 	}
 	s.sessions[sess.SessionID] = next
+	if next.DeviceID != "" {
+		if _, ok := s.sessionsByDevice[next.DeviceID]; !ok {
+			s.sessionsByDevice[next.DeviceID] = make(map[string]struct{})
+		}
+		s.sessionsByDevice[next.DeviceID][next.SessionID] = struct{}{}
+	}
 	return true, nil
 }
 
@@ -226,7 +305,17 @@ func (s *InMemoryStateStore) SaveSession(_ context.Context, sess *sessionState) 
 	} else if next.Version <= 0 {
 		next.Version = 1
 	}
+	// Update device index if device changed
+	if exists && current != nil && current.DeviceID != next.DeviceID {
+		s.removeSessionFromDeviceIndexLocked(current.DeviceID, next.SessionID)
+	}
 	s.sessions[sess.SessionID] = next
+	if next.DeviceID != "" {
+		if _, ok := s.sessionsByDevice[next.DeviceID]; !ok {
+			s.sessionsByDevice[next.DeviceID] = make(map[string]struct{})
+		}
+		s.sessionsByDevice[next.DeviceID][next.SessionID] = struct{}{}
+	}
 	return nil
 }
 
@@ -268,6 +357,16 @@ func (s *InMemoryStateStore) UpdateSession(_ context.Context, sessionID string, 
 	}
 
 	working.Version = baseVersion + 1
+	// Maintain sessionsByDevice index if DeviceID changed
+	if current.DeviceID != working.DeviceID {
+		s.removeSessionFromDeviceIndexLocked(current.DeviceID, sessionID)
+		if working.DeviceID != "" {
+			if _, ok := s.sessionsByDevice[working.DeviceID]; !ok {
+				s.sessionsByDevice[working.DeviceID] = make(map[string]struct{})
+			}
+			s.sessionsByDevice[working.DeviceID][sessionID] = struct{}{}
+		}
+	}
 	s.sessions[sessionID] = working
 	return cloneSessionState(working), nil
 }
@@ -288,9 +387,11 @@ func (s *InMemoryStateStore) ListSessions(_ context.Context) ([]*sessionState, e
 func (s *InMemoryStateStore) ListSessionsByDevice(_ context.Context, deviceID string) ([]*sessionState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*sessionState, 0)
-	for _, sess := range s.sessions {
-		if sess == nil || sess.DeviceID != deviceID {
+	ids := s.sessionsByDevice[deviceID]
+	out := make([]*sessionState, 0, len(ids))
+	for sid := range ids {
+		sess := s.sessions[sid]
+		if sess == nil {
 			continue
 		}
 		out = append(out, cloneSessionState(sess))
@@ -685,6 +786,9 @@ func (s *InMemoryStateStore) DeleteActiveRoute(_ context.Context, routeID string
 func (s *InMemoryStateStore) DeleteSession(_ context.Context, sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		s.removeSessionFromDeviceIndexLocked(sess.DeviceID, sessionID)
+	}
 	delete(s.sessions, sessionID)
 	return nil
 }
@@ -754,14 +858,27 @@ func (s *InMemoryStateStore) RenewRouteLease(_ context.Context, routeID, nodeID 
 }
 
 func (s *InMemoryStateStore) GetRouteLease(_ context.Context, routeID string) (RouteLease, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Optimistic read lock — most calls return a valid lease.
+	s.mu.RLock()
 	current, exists := s.routeLeases[routeID]
+	s.mu.RUnlock()
 	if !exists {
 		return RouteLease{}, false, nil
 	}
 	if time.Now().UTC().After(current.ExpiresAt) {
-		delete(s.routeLeases, routeID)
+		// Expired: escalate to write lock to clean up.
+		s.mu.Lock()
+		cur, ok := s.routeLeases[routeID]
+		if ok && time.Now().UTC().After(cur.ExpiresAt) {
+			delete(s.routeLeases, routeID)
+			s.mu.Unlock()
+			return RouteLease{}, false, nil
+		}
+		// Another goroutine renewed the lease between our RLock and Lock.
+		s.mu.Unlock()
+		if ok {
+			return cur, true, nil
+		}
 		return RouteLease{}, false, nil
 	}
 	return current, true, nil
@@ -776,6 +893,39 @@ func (s *InMemoryStateStore) ReleaseRouteLease(_ context.Context, routeID, nodeI
 	}
 	if current.NodeID == nodeID {
 		delete(s.routeLeases, routeID)
+	}
+	return nil
+}
+
+func (s *InMemoryStateStore) CheckAndReserveIdempotencyKey(_ context.Context, key string, ttl time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if expiry, exists := s.idempotencyKeys[key]; exists && now.Before(expiry) {
+		return false, nil
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	s.idempotencyKeys[key] = now.Add(ttl)
+	return true, nil
+}
+
+func (s *InMemoryStateStore) ReleaseIdempotencyKey(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.idempotencyKeys, key)
+	return nil
+}
+
+func (s *InMemoryStateStore) SweepExpiredIdempotencyKeys(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for k, expiry := range s.idempotencyKeys {
+		if now.After(expiry) {
+			delete(s.idempotencyKeys, k)
+		}
 	}
 	return nil
 }
@@ -871,6 +1021,33 @@ func (s *InMemoryStateStore) putShareGrantInDeviceIndexLocked(deviceID string, g
 	}
 	filtered = append(filtered, grant)
 	s.grantsByDevice[deviceID] = filtered
+}
+
+func (s *InMemoryStateStore) removeSessionFromDeviceIndexLocked(deviceID, sessionID string) {
+	if deviceID == "" || sessionID == "" {
+		return
+	}
+	if ids, ok := s.sessionsByDevice[deviceID]; ok {
+		delete(ids, sessionID)
+		if len(ids) == 0 {
+			delete(s.sessionsByDevice, deviceID)
+		}
+	}
+}
+
+func (s *InMemoryStateStore) ListStaleSessions(_ context.Context, updatedBefore int64) ([]*sessionState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*sessionState
+	for _, sess := range s.sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.UpdatedAt <= updatedBefore {
+			out = append(out, cloneSessionState(sess))
+		}
+	}
+	return out, nil
 }
 
 func (s *InMemoryStateStore) removeShareGrantFromDeviceIndexLocked(deviceID, grantID string) {

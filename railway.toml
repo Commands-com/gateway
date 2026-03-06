@@ -1,8 +1,9 @@
 [build]
 builder = "NIXPACKS"
+buildCommand = "go build -o /app/server ./cmd/server"
 
 [deploy]
-startCommand = "go run ./cmd/server"
+startCommand = "/app/server"
 healthcheckPath = "/readyz"
 healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"

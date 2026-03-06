@@ -45,6 +45,8 @@ type Config struct {
 	OAuthClientName      string
 	OAuthRedirectURIs    []string
 
+	ProxyHeader string
+
 	IngressRateWindowSeconds    int
 	IngressGlobalLimitPerWindow int
 	IngressIPLimitPerWindow     int
@@ -91,6 +93,8 @@ func Load() (*Config, error) {
 		OAuthDefaultClientID: envOrDefault("OAUTH_DEFAULT_CLIENT_ID", "oss-gateway-public-client"),
 		OAuthClientName:      envOrDefault("OAUTH_CLIENT_NAME", "OSS Gateway"),
 		OAuthRedirectURIs:    csvOrDefault("OAUTH_REDIRECT_URIS", nil),
+
+		ProxyHeader: strings.TrimSpace(os.Getenv("PROXY_HEADER")),
 
 		IngressRateWindowSeconds:    intFromEnv("INGRESS_RATE_WINDOW_SECONDS", 60, 1, 3600),
 		IngressGlobalLimitPerWindow: intFromEnv("INGRESS_GLOBAL_LIMIT_PER_WINDOW", 3000, 1, 1000000),

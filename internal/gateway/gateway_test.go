@@ -57,7 +57,7 @@ func TestListDevicesAllowsOwnerByEmailFallback(t *testing.T) {
 	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devmail1/identity-key", identityPayload(identityKey), "owner-uid-a", "dtannen@example.com", fiber.StatusNoContent)
 
 	// Different UID, same canonical email should still be treated as owner.
-	if !h.canAccessDeviceForPrincipal("owner-uid-b", "dtannen@example.com", "devmail1") {
+	if !h.canAccessDeviceForPrincipal(context.Background(), "owner-uid-b", "dtannen@example.com", "devmail1") {
 		t.Fatalf("expected email fallback owner access to device")
 	}
 }
@@ -74,7 +74,7 @@ func TestOwnerEmailFallbackDisabledOutsideDemo(t *testing.T) {
 	identityKey, _ := testEd25519Identity("owner-nondemo")
 	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devnondemo1/identity-key", identityPayload(identityKey), "owner-uid-a", "same@example.com", fiber.StatusNoContent)
 
-	if h.canAccessDeviceForPrincipal("owner-uid-b", "same@example.com", "devnondemo1") {
+	if h.canAccessDeviceForPrincipal(context.Background(), "owner-uid-b", "same@example.com", "devnondemo1") {
 		t.Fatalf("expected email fallback to be disabled in non-demo auth mode")
 	}
 }
@@ -207,7 +207,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		t.Fatalf("list grants by device before revoke failed: %v", err)
 	}
 	indexed := len(grantsBefore)
-	hasAccessBeforeRevoke := h.canAccessDevice("collab1", "devowner1")
+	hasAccessBeforeRevoke := h.canAccessDevice(context.Background(), "collab1", "devowner1")
 	if indexed != 1 {
 		t.Fatalf("expected 1 indexed grant for device, got %d", indexed)
 	}
@@ -222,7 +222,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		t.Fatalf("list grants by device after revoke failed: %v", err)
 	}
 	indexed = len(grantsAfter)
-	hasAccessAfterRevoke := h.canAccessDevice("collab1", "devowner1")
+	hasAccessAfterRevoke := h.canAccessDevice(context.Background(), "collab1", "devowner1")
 	if indexed != 0 {
 		t.Fatalf("expected 0 indexed grants after revoke, got %d", indexed)
 	}
@@ -311,7 +311,7 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 		t.Fatalf("expected forwarded agent payload with message_id msg-1")
 	}
 
-	events := h.replayEvents("sessabc1", "")
+	events := h.replayEvents(context.Background(), "sessabc1", "")
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event (handshake ack), got %d", len(events))
 	}
