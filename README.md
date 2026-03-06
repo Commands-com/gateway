@@ -1,211 +1,205 @@
-# OSS Commands Gateway
+<div align="center">
 
-Modular OSS gateway for OAuth, device sharing, relay, and webhook tunneling.
+# Commands Gateway (OSS)
 
-## What This Repo Focuses On
+**Deploy your own encrypted relay. Own your infrastructure.**
 
-- Fast deployment for collaboration testing.
-- Explicit auth modes: `demo`, `firebase`, `oidc`.
-- Memory-only runtime state (no Redis required).
-- Clean OSS baseline for share + relay + webhook flows.
+[![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8.svg)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![Encryption](https://img.shields.io/badge/E2EE-X25519%20%2B%20AES--256--GCM-8B5CF6.svg)](#relay-security)
+[![Deploy](https://img.shields.io/badge/Deploy-Railway-0B0D0E.svg)](#deploy-to-railway)
 
-## Project Layout
+Self-hosted gateway for OAuth, device relay, session sharing, and webhook tunneling.
+Memory-only runtime — no Redis, no database, no external dependencies.
 
-- `cmd/server` - process entrypoint
-- `internal/app` - dependency wiring and route registration
-- `internal/config` - environment contract and validation
-- `internal/oauth` - OAuth/OIDC surfaces (authorize/token/views)
-- `internal/gateway` - device/share/session + websocket tunnel handlers
-- `internal/jwt` - issued-token signing and verification
-- `internal/idtoken` - upstream identity token verifiers
-- `internal/health` - health/readiness handlers
-- `docs/openapi.yaml` - endpoint contract
-- `docs/release.md` - release checklist
+```
+Agent  <── E2EE ──>  Gateway (you host this)  <── E2EE ──>  Browser / Desktop
+```
 
-## Prerequisites
+</div>
 
-- Go 1.25+ (required by Fiber v3)
+---
 
-## Quick Start (Memory Backend)
+## Highlights
 
-1. Create env file:
+| | |
+|---|---|
+| **Zero dependencies** | Single Go binary, in-memory state, no Redis or database required |
+| **Built-in console** | Admin UI at `/console` — devices, sessions, shares, dashboard |
+| **Flexible auth** | Demo mode for testing, Firebase popup sign-in, or any OIDC provider |
+| **E2E encrypted relay** | X25519 + HKDF + AES-256-GCM, direction-split keys, replay protection |
+| **Webhook tunneling** | Route external webhooks (Slack, GitHub, etc.) to local agents over WebSocket |
+| **One-click deploy** | Railway template with auto-detected public URL |
+
+## Requirements
+
+- Go 1.25+
+
+## Quick Start
 
 ```bash
+git clone https://github.com/Commands-com/gateway.git
+cd gateway
 cp .env.example .env
 ```
 
-2. Generate a signing key and set env vars:
+Generate a signing key and update `.env`:
 
 ```bash
-# Generate a strong random key
 openssl rand -base64 48
 ```
 
-```bash
-PORT=8080
-JWT_SIGNING_KEY=<paste-generated-key-here>
+```env
+JWT_SIGNING_KEY=<paste-generated-key>
 AUTH_MODE=demo
-STATE_BACKEND=memory
 ```
 
-3. Run:
+Run:
 
 ```bash
 go run ./cmd/server
 ```
 
-4. Verify:
+Verify:
 
 ```bash
-curl -s http://localhost:8080/healthz
-curl -s http://localhost:8080/readyz
+curl http://localhost:8080/healthz
+curl http://localhost:8080/readyz
 ```
 
-### Out-Of-The-Box Local Run (Commands Desktop Compatible)
+Open the console at [http://localhost:8080/console](http://localhost:8080/console).
+
+### Desktop Agent Compatibility
+
+For use with the [Commands.com Agent](https://github.com/Commands-com/commands-com-agent-hub):
 
 ```bash
 export JWT_SIGNING_KEY="$(openssl rand -hex 32)"
-PORT=8091 PUBLIC_BASE_URL=http://localhost:8091 AUTH_MODE=demo STATE_BACKEND=memory \
+PORT=8091 AUTH_MODE=demo \
 OAUTH_DEFAULT_CLIENT_ID=commands-desktop-public \
 REDIRECT_ALLOWLIST='http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob' \
-OAUTH_REDIRECT_URIS='http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob' \
 go run ./cmd/server
 ```
 
-## Commands.com Desktop Compatibility
-
-If you are pairing this OSS gateway with the current commands.com desktop app, set:
-
-```bash
-OAUTH_DEFAULT_CLIENT_ID=commands-desktop-public
-REDIRECT_ALLOWLIST=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
-OAUTH_REDIRECT_URIS=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
-```
-
-## Built-in Console
-
-The gateway includes a built-in admin console at `/console` with device management,
-session chat, and dashboard. It authenticates through the same OAuth flow as all other clients.
-
-## Deploy to Railway (10-Minute Path)
+## Deploy to Railway
 
 1. Create a Railway project from this repo.
-2. Add env vars:
-   - `JWT_SIGNING_KEY` — generate with `openssl rand -base64 48`
-   - `AUTH_MODE=demo` (or `oidc` for Firebase — see below)
-   - `STATE_BACKEND=memory`
-   - `PUBLIC_BASE_URL` is auto-detected from `RAILWAY_PUBLIC_DOMAIN`; only set it if using a custom domain
+2. Set environment variables:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `JWT_SIGNING_KEY` | `openssl rand -base64 48` | Required, >= 32 bytes |
+| `AUTH_MODE` | `demo` or `oidc` | See [Auth Modes](#auth-modes) |
+
+`PUBLIC_BASE_URL` is auto-detected from `RAILWAY_PUBLIC_DOMAIN`. Only set it for custom domains.
+
 3. Deploy.
-4. Visit `https://<your-domain>/console` or set the URL as `Gateway URL` in desktop settings.
+4. Visit `https://<your-domain>/console`.
+
+### Firebase on Railway
+
+For Google/GitHub sign-in via Firebase, add these vars:
+
+| Variable | Value |
+|---|---|
+| `AUTH_MODE` | `oidc` |
+| `OIDC_ISSUER_URL` | `https://securetoken.google.com/<project-id>` |
+| `OIDC_CLIENT_ID` | `<project-id>` |
+| `FIREBASE_API_KEY` | Your Firebase web API key (public) |
+| `FIREBASE_PROJECT_ID` | Your Firebase project ID |
+
+Then add your Railway domain to **Firebase Console > Authentication > Settings > Authorized domains**.
+
+No credentials file needed — OIDC validates tokens via Firebase's public JWKS.
 
 ## Auth Modes
 
-- `AUTH_MODE=demo`
-  - Fast local/shared testing.
-  - Non-production mode.
-  - OAuth still issues signed gateway tokens.
-- `AUTH_MODE=firebase`
-  - Verifies Firebase ID tokens server-side using the Firebase Admin SDK.
-  - Requires `FIREBASE_PROJECT_ID`.
-  - Optional: `FIREBASE_CREDENTIALS_PATH`.
-- `AUTH_MODE=oidc`
-  - Verifies generic OIDC ID tokens via the issuer's public JWKS.
-  - Requires `OIDC_ISSUER_URL` and `OIDC_CLIENT_ID`.
-  - Works with Firebase — set `OIDC_ISSUER_URL=https://securetoken.google.com/<project-id>` and `OIDC_CLIENT_ID=<project-id>`. No credentials file needed.
+| Mode | Use case | Required vars |
+|---|---|---|
+| `demo` | Local dev, testing | None beyond `JWT_SIGNING_KEY` |
+| `firebase` | Firebase Admin SDK verification | `FIREBASE_PROJECT_ID` |
+| `oidc` | Any OIDC provider (inc. Firebase) | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` |
 
-### Firebase Sign-In UI
+When `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` are set, the authorize page shows
+Google and GitHub popup sign-in buttons. Works with both `firebase` and `oidc` modes.
 
-When `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` are set, the OAuth authorize page
-shows Google and GitHub sign-in buttons powered by Firebase Authentication (popup flow).
-This works with both `AUTH_MODE=firebase` and `AUTH_MODE=oidc`.
+## Relay Security
 
-Required env vars:
-- `FIREBASE_API_KEY` — your Firebase project's web API key (public, safe to expose)
-- `FIREBASE_PROJECT_ID` — your Firebase project ID
+- **Handshake**: X25519 ephemeral key exchange with Ed25519 identity signatures
+- **Key derivation**: HKDF-SHA256 with transcript hash salt, direction-split keys
+- **Encryption**: AES-256-GCM with deterministic nonces and AAD binding
+- **Replay protection**: Monotonic sequence enforcement, idempotency keys, transport tokens
+- **Frame validation**: `REQUIRE_ENCRYPTED_FRAMES=true` by default
 
-You must also add your deployment domain (e.g. `gateway-xyz.up.railway.app`) to
-**Firebase Console → Authentication → Settings → Authorized domains**.
+| Config | Default | Description |
+|---|---|---|
+| `REQUIRE_ENCRYPTED_FRAMES` | `true` | Reject unencrypted session frames |
+| `IDEMPOTENCY_TTL_SECONDS` | `300` | Dedup window for message delivery |
+| `TRANSPORT_TOKEN_SECRET` | derived from `JWT_SIGNING_KEY` | WebSocket transport auth |
+| `TRANSPORT_TOKEN_TTL_SECONDS` | `3600` | Transport token lifetime |
 
-## Scope Policy
+## Built-in Console
 
-Gateway routes require an authenticated user token.
-Only device registration, agent handshake ack, and websocket agent/tunnel connect enforce `device` scope:
+The gateway serves an admin console at `/console`:
 
-- `device`
-  - `PUT /gateway/v1/devices/:device_id/identity-key`
-  - `POST /gateway/v1/sessions/:session_id/handshake/agent-ack`
-  - `GET /gateway/v1/agent/connect` (WebSocket)
-  - `GET /gateway/v1/integrations/tunnel/connect` (WebSocket)
+- **Dashboard** — connected devices, active sessions, health status
+- **Devices** — online/offline status, identity keys, quick session launch
+- **Sessions** — E2E encrypted chat with agents, handshake status
+- **Shares** — invite management, grant lifecycle, revoke controls
 
-## Ingress Rate Limits
+Authenticates through the same OAuth flow as all other clients.
 
-Public ingress uses in-memory fixed-window limits (default 60s window):
+## API Endpoints
 
-- `INGRESS_GLOBAL_LIMIT_PER_WINDOW` (default `3000`)
-- `INGRESS_IP_LIMIT_PER_WINDOW` (default `600`)
-- `INGRESS_ROUTE_LIMIT_PER_WINDOW` (default `300`)
+<details>
+<summary><strong>System</strong></summary>
 
-## Relay Security Defaults
+- `GET /healthz` — liveness
+- `GET /readyz` — readiness
+- `GET /console` — admin UI
 
-- Handshake requires:
-  - `device_id`
-  - `handshake_id`
-  - `client_ephemeral_public_key` (32-byte base64 value)
-  - `client_session_nonce`
-- Agent ack is signature-verified against device identity key.
-- Session messages require `X-Idempotency-Key`.
-- Encrypted envelope (`encrypted`, `ciphertext`, `nonce`, `tag`, `seq`) is enforced by default.
-- Replay checks are enforced in-memory for:
-  - `client_to_agent` message `seq`
-  - `agent_to_client` frame `seq`
-- WebSocket transport replay protection is enabled when `TRANSPORT_TOKEN_SECRET` is set.
-  - If unset in env, it defaults to `JWT_SIGNING_KEY`.
+</details>
 
-Config knobs:
-
-- `IDEMPOTENCY_TTL_SECONDS` (default `300`)
-- `REQUIRE_ENCRYPTED_FRAMES` (default `true`)
-- `TRANSPORT_TOKEN_SECRET` (default: `JWT_SIGNING_KEY`)
-- `TRANSPORT_TOKEN_TTL_SECONDS` (default `3600`)
-
-## Endpoint Contract
-
-- OpenAPI-level contract: [`docs/openapi.yaml`](./docs/openapi.yaml)
-- Release checklist: [`docs/release.md`](./docs/release.md)
-
-## Endpoints
-
-System:
-
-- `GET /healthz`
-- `GET /readyz`
-
-OAuth:
+<details>
+<summary><strong>OAuth</strong></summary>
 
 - `GET /.well-known/openid-configuration`
 - `GET /.well-known/jwks.json`
 - `GET|POST /oauth/authorize`
 - `POST /oauth/token`
 - `POST /oauth/token/revoke`
+- `POST /register` — dynamic client registration
 
-Gateway relay/share:
+</details>
+
+<details>
+<summary><strong>Gateway — Devices & Sessions</strong></summary>
 
 - `GET /gateway/v1/health`
 - `PUT /gateway/v1/devices/:device_id/identity-key`
 - `GET /gateway/v1/devices/:device_id/identity-key`
+- `POST /gateway/v1/sessions/:session_id/handshake/client-init`
+- `GET /gateway/v1/sessions/:session_id/handshake/:handshake_id`
+- `POST /gateway/v1/sessions/:session_id/handshake/agent-ack`
+- `POST /gateway/v1/sessions/:session_id/messages`
+- `GET /gateway/v1/sessions/:session_id/events` (SSE)
+- `GET /gateway/v1/agent/connect` (WebSocket)
+
+</details>
+
+<details>
+<summary><strong>Gateway — Shares</strong></summary>
+
 - `POST /gateway/v1/shares/invites`
 - `POST /gateway/v1/shares/invites/accept`
 - `GET /gateway/v1/shares/devices/:device_id/grants`
 - `POST /gateway/v1/shares/grants/:grant_id/revoke`
 - `POST /gateway/v1/shares/grants/:grant_id/leave`
-- `POST /gateway/v1/sessions/:session_id/handshake/client-init`
-- `GET /gateway/v1/sessions/:session_id/handshake/:handshake_id`
-- `POST /gateway/v1/sessions/:session_id/handshake/agent-ack`
-- `POST /gateway/v1/sessions/:session_id/messages`
-- `GET /gateway/v1/sessions/:session_id/events`
-- `GET /gateway/v1/agent/connect` (WebSocket)
 
-Integrations + webhook tunnel:
+</details>
+
+<details>
+<summary><strong>Integrations & Webhook Tunnel</strong></summary>
 
 - `POST /gateway/v1/integrations/routes`
 - `PUT /gateway/v1/integrations/routes/:route_id`
@@ -215,21 +209,49 @@ Integrations + webhook tunnel:
 - `GET /gateway/v1/integrations/tunnel/connect` (WebSocket)
 - `ALL /integrations/:route_id/:route_token` (public ingress)
 
+</details>
+
+## Rate Limits
+
+Public ingress uses in-memory fixed-window rate limiting:
+
+| Config | Default |
+|---|---|
+| `INGRESS_RATE_WINDOW_SECONDS` | `60` |
+| `INGRESS_GLOBAL_LIMIT_PER_WINDOW` | `3000` |
+| `INGRESS_IP_LIMIT_PER_WINDOW` | `600` |
+| `INGRESS_ROUTE_LIMIT_PER_WINDOW` | `300` |
+
+## Project Layout
+
+```
+cmd/server          Process entrypoint
+internal/app        Dependency wiring and route registration
+internal/config     Environment contract and validation
+internal/console    Built-in admin UI (embedded HTML)
+internal/oauth      OAuth/OIDC (authorize, token, views)
+internal/gateway    Device, share, session, tunnel handlers
+internal/jwt        Token signing and verification
+internal/idtoken    Upstream identity token verifiers
+internal/health     Health/readiness handlers
+docs/openapi.yaml   Endpoint contract
+```
+
 ## Testing
 
 ```bash
 go test ./...
 ```
 
-## CORS Configuration
+## CORS
 
-The default `ALLOW_ORIGINS=*` is suitable for `AUTH_MODE=demo` local development.
-For production deployments using `firebase` or `oidc` auth modes, restrict
-`ALLOW_ORIGINS` to your application's actual origin(s) (e.g.
-`ALLOW_ORIGINS=https://app.example.com`). A wildcard origin disables
-credential support and weakens browser-side request isolation.
+Default `ALLOW_ORIGINS=*` is suitable for demo mode. For production, restrict to your app's origin:
 
-## Notes
+```env
+ALLOW_ORIGINS=https://app.example.com
+```
 
-- Runtime state is in-memory and single-process.
-- This baseline intentionally excludes MCP and Redis dependencies.
+## Additional Docs
+
+- OpenAPI spec: [`docs/openapi.yaml`](./docs/openapi.yaml)
+- Release checklist: [`docs/release.md`](./docs/release.md)

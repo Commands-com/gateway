@@ -1024,12 +1024,15 @@ const Shares = {
         const r = await api('/shares/devices/' + device.device_id + '/grants');
         if (!r.ok) continue;
         const data = await r.json();
-        const grants = data.grants || [];
-        html += `<div class="card"><h3>${esc(device.display_name || device.device_id)}</h3>`;
-        if (grants.length === 0) {
+        const allGrants = data.grants || [];
+        const active = allGrants.filter(g => g.status === 'active' || g.status === 'pending');
+        const inactive = allGrants.filter(g => g.status !== 'active' && g.status !== 'pending');
+        const devId = device.device_id;
+        html += `<div class="card"><h3>${esc(device.display_name || devId)}</h3>`;
+        if (active.length === 0 && inactive.length === 0) {
           html += `<div style="color:var(--text2);font-size:14px">No shares</div>`;
         } else {
-          html += grants.map(g => `
+          const renderGrant = g => `
             <div class="grant-row">
               <div>
                 <div>${esc(g.granteeEmail || g.granteeUid || 'Pending')}</div>
@@ -1039,8 +1042,12 @@ const Shares = {
                 <span class="badge ${g.status}">${esc(g.status)}</span>
                 ${g.status === 'active' || g.status === 'pending' ? `<button class="danger small" onclick="Shares.revoke('${esc(g.grantId)}')">Revoke</button>` : ''}
               </div>
-            </div>
-          `).join('');
+            </div>`;
+          html += active.map(renderGrant).join('');
+          if (inactive.length > 0) {
+            html += `<details style="margin-top:8px"><summary style="cursor:pointer;font-size:12px;color:var(--text2)">${inactive.length} revoked/expired</summary>
+              <div style="opacity:0.6">${inactive.map(renderGrant).join('')}</div></details>`;
+          }
         }
         html += `</div>`;
       } catch (e) { }
