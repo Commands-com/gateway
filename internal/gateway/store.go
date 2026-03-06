@@ -41,6 +41,7 @@ type StateStore interface {
 	SaveDevice(ctx context.Context, dev deviceRecord) error
 	GetDevice(ctx context.Context, deviceID string) (deviceRecord, bool, error)
 	ListDevices(ctx context.Context) ([]deviceRecord, error)
+	ListDevicesByOwner(ctx context.Context, ownerUID string) ([]deviceRecord, error)
 
 	// Sessions
 	CreateSession(ctx context.Context, sess *sessionState) (bool, error)
@@ -55,6 +56,7 @@ type StateStore interface {
 	GetShareGrant(ctx context.Context, grantID string) (*shareGrant, bool, error)
 	ListShareGrants(ctx context.Context) ([]*shareGrant, error)
 	ListShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
+	ListShareGrantsByGranteeUID(ctx context.Context, granteeUID string) ([]*shareGrant, error)
 	ListAllShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
 	DeleteShareGrantFromDeviceIndex(ctx context.Context, deviceID, grantID string) error
 	SaveInviteGrantMapping(ctx context.Context, tokenHash, grantID string) error
@@ -77,6 +79,8 @@ type StateStore interface {
 	// Session events
 	AppendSessionEvent(ctx context.Context, sessionID string, payload []byte, maxBacklog int) (sessionEvent, error)
 	ListSessionEvents(ctx context.Context, sessionID string) ([]sessionEvent, error)
+	DeleteSession(ctx context.Context, sessionID string) error
+	DeleteSessionEvents(ctx context.Context, sessionID string) error
 
 	// Route lease ownership (for multi-node ingress/tunnel routing).
 	ClaimRouteLease(ctx context.Context, routeID, nodeID string, ttl time.Duration) (RouteLease, bool, error)
@@ -99,9 +103,12 @@ type InMemoryStateStore struct {
 	mu sync.RWMutex
 
 	devices        map[string]deviceRecord
-	grants         map[string]*shareGrant
-	grantsByDevice map[string][]*shareGrant
-	inviteToID     map[string]string
+	devicesByOwner map[string]map[string]struct{}
+	grants             map[string]*shareGrant
+	grantsByDevice     map[string][]*shareGrant
+	allGrantsByDevice  map[string]map[string]struct{} // device→grantIDs (includes revoked)
+	grantsByGrantee    map[string]map[string]struct{}
+	inviteToID         map[string]string
 	sessions       map[string]*sessionState
 
 	integrationRoutes        map[string]*integrationRoute
@@ -117,8 +124,11 @@ type InMemoryStateStore struct {
 func NewInMemoryStateStore() *InMemoryStateStore {
 	return &InMemoryStateStore{
 		devices:                  make(map[string]deviceRecord),
+		devicesByOwner:           make(map[string]map[string]struct{}),
 		grants:                   make(map[string]*shareGrant),
 		grantsByDevice:           make(map[string][]*shareGrant),
+		allGrantsByDevice:        make(map[string]map[string]struct{}),
+		grantsByGrantee:          make(map[string]map[string]struct{}),
 		inviteToID:               make(map[string]string),
 		sessions:                 make(map[string]*sessionState),
 		integrationRoutes:        make(map[string]*integrationRoute),
@@ -132,7 +142,23 @@ func NewInMemoryStateStore() *InMemoryStateStore {
 func (s *InMemoryStateStore) SaveDevice(_ context.Context, dev deviceRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	old, hadOld := s.devices[dev.DeviceID]
 	s.devices[dev.DeviceID] = dev
+	// Maintain owner index
+	if hadOld && old.OwnerUID != "" && old.OwnerUID != dev.OwnerUID {
+		if ownerDevs, ok := s.devicesByOwner[old.OwnerUID]; ok {
+			delete(ownerDevs, dev.DeviceID)
+			if len(ownerDevs) == 0 {
+				delete(s.devicesByOwner, old.OwnerUID)
+			}
+		}
+	}
+	if dev.OwnerUID != "" {
+		if _, ok := s.devicesByOwner[dev.OwnerUID]; !ok {
+			s.devicesByOwner[dev.OwnerUID] = make(map[string]struct{})
+		}
+		s.devicesByOwner[dev.OwnerUID][dev.DeviceID] = struct{}{}
+	}
 	return nil
 }
 
@@ -149,6 +175,19 @@ func (s *InMemoryStateStore) ListDevices(_ context.Context) ([]deviceRecord, err
 	out := make([]deviceRecord, 0, len(s.devices))
 	for _, dev := range s.devices {
 		out = append(out, dev)
+	}
+	return out, nil
+}
+
+func (s *InMemoryStateStore) ListDevicesByOwner(_ context.Context, ownerUID string) ([]deviceRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := s.devicesByOwner[ownerUID]
+	out := make([]deviceRecord, 0, len(ids))
+	for deviceID := range ids {
+		if dev, ok := s.devices[deviceID]; ok {
+			out = append(out, dev)
+		}
 	}
 	return out, nil
 }
@@ -269,6 +308,28 @@ func (s *InMemoryStateStore) SaveShareGrant(_ context.Context, grant *shareGrant
 	stored := cloneShareGrant(grant)
 	old, hadOld := s.grants[grant.GrantID]
 	s.grants[grant.GrantID] = stored
+
+	// Maintain grantee UID index
+	oldGranteeUID := ""
+	if hadOld && old != nil {
+		oldGranteeUID = old.GranteeUID
+	}
+	if oldGranteeUID != "" && oldGranteeUID != stored.GranteeUID {
+		if granteeGrants, ok := s.grantsByGrantee[oldGranteeUID]; ok {
+			delete(granteeGrants, stored.GrantID)
+			if len(granteeGrants) == 0 {
+				delete(s.grantsByGrantee, oldGranteeUID)
+			}
+		}
+	}
+	if stored.GranteeUID != "" {
+		if _, ok := s.grantsByGrantee[stored.GranteeUID]; !ok {
+			s.grantsByGrantee[stored.GranteeUID] = make(map[string]struct{})
+		}
+		s.grantsByGrantee[stored.GranteeUID][stored.GrantID] = struct{}{}
+	}
+
+	// Maintain device index
 	oldDeviceID := ""
 	if hadOld && old != nil {
 		oldDeviceID = old.DeviceID
@@ -281,8 +342,20 @@ func (s *InMemoryStateStore) SaveShareGrant(_ context.Context, grant *shareGrant
 	}
 	if oldDeviceID != "" && oldDeviceID != stored.DeviceID {
 		s.removeShareGrantFromDeviceIndexLocked(oldDeviceID, stored.GrantID)
+		// Move in all-grants index too
+		if ids, ok := s.allGrantsByDevice[oldDeviceID]; ok {
+			delete(ids, stored.GrantID)
+			if len(ids) == 0 {
+				delete(s.allGrantsByDevice, oldDeviceID)
+			}
+		}
 	}
 	s.putShareGrantInDeviceIndexLocked(stored.DeviceID, stored)
+	// Maintain all-grants-by-device index (includes revoked/expired)
+	if _, ok := s.allGrantsByDevice[stored.DeviceID]; !ok {
+		s.allGrantsByDevice[stored.DeviceID] = make(map[string]struct{})
+	}
+	s.allGrantsByDevice[stored.DeviceID][stored.GrantID] = struct{}{}
 	return nil
 }
 
@@ -323,14 +396,31 @@ func (s *InMemoryStateStore) ListShareGrantsByDevice(_ context.Context, deviceID
 	return out, nil
 }
 
-// ListAllShareGrantsByDevice returns all grants for a device from the main grants map,
-// including revoked/expired ones that have been removed from the device index.
+func (s *InMemoryStateStore) ListShareGrantsByGranteeUID(_ context.Context, granteeUID string) ([]*shareGrant, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := s.grantsByGrantee[granteeUID]
+	out := make([]*shareGrant, 0, len(ids))
+	for grantID := range ids {
+		grant, ok := s.grants[grantID]
+		if !ok || grant == nil {
+			continue
+		}
+		out = append(out, cloneShareGrant(grant))
+	}
+	return out, nil
+}
+
+// ListAllShareGrantsByDevice returns all grants for a device,
+// including revoked/expired ones that have been removed from the active device index.
 func (s *InMemoryStateStore) ListAllShareGrantsByDevice(_ context.Context, deviceID string) ([]*shareGrant, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*shareGrant, 0)
-	for _, grant := range s.grants {
-		if grant == nil || grant.DeviceID != deviceID {
+	ids := s.allGrantsByDevice[deviceID]
+	out := make([]*shareGrant, 0, len(ids))
+	for grantID := range ids {
+		grant, ok := s.grants[grantID]
+		if !ok || grant == nil {
 			continue
 		}
 		out = append(out, cloneShareGrant(grant))
@@ -404,6 +494,14 @@ func (s *InMemoryStateStore) AcceptShareInviteAtomic(_ context.Context, tokenHas
 		grant.GranteeDeviceID = granteeDeviceID
 	}
 	delete(s.inviteToID, tokenHash)
+
+	// Maintain grantee UID index
+	if acceptorUID != "" {
+		if _, ok := s.grantsByGrantee[acceptorUID]; !ok {
+			s.grantsByGrantee[acceptorUID] = make(map[string]struct{})
+		}
+		s.grantsByGrantee[acceptorUID][grant.GrantID] = struct{}{}
+	}
 
 	return cloneShareGrant(grant), nil
 }
@@ -584,6 +682,20 @@ func (s *InMemoryStateStore) DeleteActiveRoute(_ context.Context, routeID string
 	return nil
 }
 
+func (s *InMemoryStateStore) DeleteSession(_ context.Context, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, sessionID)
+	return nil
+}
+
+func (s *InMemoryStateStore) DeleteSessionEvents(_ context.Context, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.events, sessionID)
+	return nil
+}
+
 func (s *InMemoryStateStore) AppendSessionEvent(_ context.Context, sessionID string, payload []byte, maxBacklog int) (sessionEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -671,13 +783,7 @@ func (s *InMemoryStateStore) ReleaseRouteLease(_ context.Context, routeID, nodeI
 func (s *InMemoryStateStore) CountDevicesByOwner(_ context.Context, ownerUID string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	count := 0
-	for _, dev := range s.devices {
-		if dev.OwnerUID == ownerUID {
-			count++
-		}
-	}
-	return count, nil
+	return len(s.devicesByOwner[ownerUID]), nil
 }
 
 func (s *InMemoryStateStore) CountDevices(_ context.Context) (int, error) {

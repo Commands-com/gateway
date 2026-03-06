@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"log"
 	"strconv"
 	"sync"
 )
@@ -32,33 +33,12 @@ func (h *Handler) appendSessionEvent(sessionID string, payload []byte) string {
 		return ""
 	}
 	_ = h.bus.PublishSessionEvent(context.Background(), sessionID, event)
-
-	h.mu.RLock()
-	subscribers := make([]*sseSubscriber, 0, len(h.subs[sessionID]))
-	for sub := range h.subs[sessionID] {
-		subscribers = append(subscribers, sub)
-	}
-	h.mu.RUnlock()
-
-	for _, sub := range subscribers {
-		select {
-		case sub.ch <- event:
-		default:
-			// Buffer full: evict the slow subscriber by signalling its done
-			// channel. We never close the data channel, so concurrent senders
-			// cannot panic.
-			h.evictSubscriber(sessionID, sub)
-		}
-	}
 	return event.ID
 }
 
 func (h *Handler) replayEvents(sessionID, lastEventID string) []sessionEvent {
 	events, err := h.store.ListSessionEvents(context.Background(), sessionID)
 	if err != nil || len(events) == 0 {
-		return nil
-	}
-	if len(events) == 0 {
 		return nil
 	}
 	if lastEventID == "" {
@@ -93,11 +73,43 @@ func (h *Handler) subscribe(sessionID, uid string) *sseSubscriber {
 		evicted:   make(chan struct{}),
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if _, ok := h.subs[sessionID]; !ok {
 		h.subs[sessionID] = make(map[*sseSubscriber]struct{})
 	}
 	h.subs[sessionID][sub] = struct{}{}
+	h.mu.Unlock()
+
+	// Subscribe to bus events and feed them into the subscriber channel.
+	busCh := make(chan sessionEvent, 64)
+	unsub, err := h.bus.SubscribeSessionEvents(context.Background(), sessionID, busCh)
+	if err != nil {
+		log.Printf("[gateway] bus_subscribe_failed session=%s uid=%s err=%v", sessionID, uid, err)
+	}
+	go func() {
+		defer func() {
+			if unsub != nil {
+				unsub()
+			}
+		}()
+		for {
+			select {
+			case <-sub.evicted:
+				return
+			case evt, ok := <-busCh:
+				if !ok {
+					return
+				}
+				select {
+				case sub.ch <- evt:
+				default:
+					// Buffer full: evict slow subscriber
+					h.evictSubscriber(sessionID, sub)
+					return
+				}
+			}
+		}
+	}()
+
 	return sub
 }
 
@@ -116,13 +128,14 @@ func (h *Handler) evictSubscriber(sessionID string, sub *sseSubscriber) {
 
 func (h *Handler) unsubscribe(sessionID string, sub *sseSubscriber) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if subs, ok := h.subs[sessionID]; ok {
 		delete(subs, sub)
 		if len(subs) == 0 {
 			delete(h.subs, sessionID)
 		}
 	}
+	h.mu.Unlock()
+	sub.evict()
 }
 
 // evictSubscribersByUID evicts all SSE subscribers for the given UID on sessions

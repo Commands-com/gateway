@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -73,14 +72,6 @@ func (h *Handler) hasActiveGrant(deviceID, uid string, now int64) bool {
 		}
 	}
 	return false
-}
-
-func randomToken(size int) (string, error) {
-	buf := make([]byte, size)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 func hashToken(token string) string {

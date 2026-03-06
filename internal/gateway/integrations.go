@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -141,7 +140,7 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Invalid device_id format", nil))
 	}
 
-	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	device, found, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load device", nil))
 	}
@@ -227,7 +226,7 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		TokenCurrentHash: hashRouteToken(plainToken),
 	}
 
-	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+	if err := h.store.SaveIntegrationRoute(c.Context(), route); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
 	}
 
@@ -267,7 +266,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Invalid device_id format", nil))
 		}
-		device, found, err := h.store.GetDevice(context.Background(), deviceID)
+		device, found, err := h.store.GetDevice(c.Context(), deviceID)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load device", nil))
 		}
@@ -283,7 +282,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 	// Pre-flight: read the route to validate ownership and request fields before
 	// the atomic update. This avoids performing side-effects (tunnel deactivation)
 	// inside the mutator.
-	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	route, found, err := h.store.GetIntegrationRoute(c.Context(), routeID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
 	}
@@ -327,7 +326,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	// Atomic update with version check
-	updated, err := h.store.UpdateIntegrationRoute(context.Background(), routeID, func(r *integrationRoute) error {
+	updated, err := h.store.UpdateIntegrationRoute(c.Context(), routeID, func(r *integrationRoute) error {
 		if r.OwnerUID != principal.UID {
 			return fmt.Errorf("forbidden")
 		}
@@ -369,9 +368,9 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 
 	var deactivatedTunnel *tunnelConn
 	if needsDeactivation {
-		if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
-			_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-			_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+		if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(c.Context(), routeID); active {
+			_ = h.store.DeleteActiveRoute(c.Context(), routeID)
+			_ = h.store.ReleaseRouteLease(c.Context(), routeID, h.nodeID)
 			h.mu.Lock()
 			if tc, ok := h.tunnelConns[activeDeviceID]; ok {
 				delete(tc.activatedRoutes, routeID)
@@ -409,7 +408,7 @@ func (h *Handler) DeleteIntegrationRoute(c fiber.Ctx) error {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	var deactivatedTunnel *tunnelConn
-	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	route, found, err := h.store.GetIntegrationRoute(c.Context(), routeID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
 	}
@@ -420,9 +419,9 @@ func (h *Handler) DeleteIntegrationRoute(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 	}
 
-	if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
-		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-		_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+	if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(c.Context(), routeID); active {
+		_ = h.store.DeleteActiveRoute(c.Context(), routeID)
+		_ = h.store.ReleaseRouteLease(c.Context(), routeID, h.nodeID)
 		h.mu.Lock()
 		if tc, ok := h.tunnelConns[activeDeviceID]; ok {
 			delete(tc.activatedRoutes, routeID)
@@ -433,7 +432,7 @@ func (h *Handler) DeleteIntegrationRoute(c fiber.Ctx) error {
 			h.stopRouteBusSubscription(deactivatedTunnel, routeID)
 		}
 	}
-	if err := h.store.DeleteIntegrationRoute(context.Background(), routeID); err != nil {
+	if err := h.store.DeleteIntegrationRoute(c.Context(), routeID); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to delete route", nil))
 	}
 
@@ -462,7 +461,7 @@ func (h *Handler) ListIntegrationRoutes(c fiber.Ctx) error {
 	interfaceType := strings.TrimSpace(c.Query("interface_type"))
 	status := strings.TrimSpace(c.Query("status"))
 
-	ownerRoutes, err := h.store.ListIntegrationRoutesByOwner(context.Background(), principal.UID)
+	ownerRoutes, err := h.store.ListIntegrationRoutesByOwner(c.Context(), principal.UID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to list routes", nil))
 	}
@@ -523,7 +522,7 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 	newHash := hashRouteToken(newPlainToken)
 
 	// Pre-flight ownership check
-	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	route, found, err := h.store.GetIntegrationRoute(c.Context(), routeID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load route", nil))
 	}
@@ -535,7 +534,7 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
-	updated, err := h.store.UpdateIntegrationRoute(context.Background(), routeID, func(r *integrationRoute) error {
+	updated, err := h.store.UpdateIntegrationRoute(c.Context(), routeID, func(r *integrationRoute) error {
 		if r.OwnerUID != principal.UID {
 			return fmt.Errorf("forbidden")
 		}

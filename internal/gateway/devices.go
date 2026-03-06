@@ -66,7 +66,7 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid public key"})
 	}
 	now := time.Now().UTC().Unix()
-	rec, exists, err := h.store.GetDevice(context.Background(), deviceID)
+	rec, exists, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
 	}
@@ -75,7 +75,7 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	}
 	// Enforce per-owner device registration limit for new devices
 	if !exists {
-		ownerDeviceCount, countErr := h.store.CountDevicesByOwner(context.Background(), principal.UID)
+		ownerDeviceCount, countErr := h.store.CountDevicesByOwner(c.Context(), principal.UID)
 		if countErr != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to count devices"})
 		}
@@ -91,7 +91,7 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	}
 	rec.IdentityKey = publicKey
 	rec.UpdatedAt = now
-	if err := h.store.SaveDevice(context.Background(), rec); err != nil {
+	if err := h.store.SaveDevice(c.Context(), rec); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save device"})
 	}
 	return c.SendStatus(fiber.StatusNoContent)
@@ -189,7 +189,7 @@ func (h *Handler) GetDeviceIdentityKey(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	rec, found, err := h.store.GetDevice(context.Background(), deviceID)
+	rec, found, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
 	}
@@ -228,21 +228,54 @@ func (h *Handler) canAccessDeviceForPrincipal(uid, email, deviceID string) bool 
 
 func (h *Handler) listVisibleDeviceSummaries(uid, email string) ([]listedDeviceSummary, error) {
 	now := time.Now().UTC().Unix()
-	records, err := h.store.ListDevices(context.Background())
+
+	// Collect owned devices via index
+	ownedRecords, err := h.store.ListDevicesByOwner(context.Background(), uid)
 	if err != nil {
 		return nil, err
 	}
 
-	out := make([]listedDeviceSummary, 0, len(records))
-	for _, rec := range records {
-		role := ""
-		if h.ownerMatchesPrincipal(rec.OwnerUID, rec.OwnerEmail, uid, email) {
-			role = "owner"
-		} else if h.hasActiveGrant(rec.DeviceID, uid, now) {
-			role = "collaborator"
-		} else {
+	// Collect granted device IDs via grantee index
+	granteeGrants, err := h.store.ListShareGrantsByGranteeUID(context.Background(), uid)
+	if err != nil {
+		return nil, err
+	}
+	grantedDeviceIDs := make(map[string]struct{})
+	for _, grant := range granteeGrants {
+		if grant == nil {
 			continue
 		}
+		if effectiveGrantStatus(grant, now) == "active" {
+			grantedDeviceIDs[grant.DeviceID] = struct{}{}
+		}
+	}
+
+	// Build deduplicated record list with roles
+	type deviceWithRole struct {
+		rec  deviceRecord
+		role string
+	}
+	seen := make(map[string]struct{}, len(ownedRecords)+len(grantedDeviceIDs))
+	candidates := make([]deviceWithRole, 0, len(ownedRecords)+len(grantedDeviceIDs))
+	for _, rec := range ownedRecords {
+		seen[rec.DeviceID] = struct{}{}
+		candidates = append(candidates, deviceWithRole{rec: rec, role: "owner"})
+	}
+	for deviceID := range grantedDeviceIDs {
+		if _, already := seen[deviceID]; already {
+			continue
+		}
+		rec, found, err := h.store.GetDevice(context.Background(), deviceID)
+		if err != nil || !found {
+			continue
+		}
+		candidates = append(candidates, deviceWithRole{rec: rec, role: "collaborator"})
+	}
+
+	out := make([]listedDeviceSummary, 0, len(candidates))
+	for _, c := range candidates {
+		rec := c.rec
+		role := c.role
 
 		connected, connectedAt, lastSeenAt := h.deviceConnectionState(rec.DeviceID)
 		status := "offline"

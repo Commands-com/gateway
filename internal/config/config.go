@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -110,7 +113,11 @@ func Load() (*Config, error) {
 		cfg.OAuthRedirectURIs = append([]string(nil), cfg.RedirectAllowlist...)
 	}
 	if cfg.TransportTokenSecret == "" {
-		cfg.TransportTokenSecret = cfg.JWTSigningKey
+		// Derive a separate secret from JWTSigningKey so transport tokens and
+		// JWTs use independent key material even when only one env var is set.
+		mac := hmac.New(sha256.New, []byte(cfg.JWTSigningKey))
+		mac.Write([]byte("transport-token-secret"))
+		cfg.TransportTokenSecret = hex.EncodeToString(mac.Sum(nil))
 	}
 
 	if cfg.PublicBaseURL == "" {

@@ -1,9 +1,10 @@
 package oauth
 
 import (
-	"crypto/rand"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"oss-commands-gateway/internal/config"
+	"oss-commands-gateway/internal/httputil"
 	"oss-commands-gateway/internal/idtoken"
 )
 
@@ -51,7 +53,7 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": methodErr.Error()})
 	}
 
-	code, err := randomToken(32)
+	code, err := httputil.RandomToken(32)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate authorization code"})
 	}
@@ -99,12 +101,13 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 			_ = c.Type("html")
 			return nil, true, c.SendString(renderDemoLogin(req))
 		}
-		if uid == "" {
-			if email != "" {
-				uid = strings.ReplaceAll(strings.Split(email, "@")[0], " ", "_")
-			} else {
-				uid = "demo-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:10]
-			}
+		if email != "" {
+			// Always derive UID from email when available so the same
+			// human gets the same UID regardless of whether the caller
+			// also sends demo_uid.
+			uid = demoDeterministicUID(email, h.cfg.JWTSigningKey)
+		} else if uid == "" {
+			uid = "demo-" + strings.ReplaceAll(uuid.NewString(), "-", "")[:10]
 		}
 		if name == "" {
 			name = firstNonEmpty(email, uid)
@@ -112,7 +115,7 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 		return &idtoken.Identity{UID: uid, Email: email, DisplayName: name}, false, nil
 	case config.AuthModeFirebase, config.AuthModeOIDC:
 		rawIDToken := firstNonEmpty(
-			bearer(c.Get("Authorization")),
+			httputil.BearerToken(c.Get("Authorization")),
 			strings.TrimSpace(c.FormValue("id_token")),
 			strings.TrimSpace(c.FormValue("firebase_token")),
 		)
@@ -303,22 +306,12 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func bearer(authHeader string) string {
-	authHeader = strings.TrimSpace(authHeader)
-	if authHeader == "" {
-		return ""
-	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(strings.ToLower(authHeader), strings.ToLower(prefix)) {
-		return ""
-	}
-	return strings.TrimSpace(authHeader[len(prefix):])
-}
-
-func randomToken(size int) (string, error) {
-	buf := make([]byte, size)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
+// demoDeterministicUID derives a stable UID from email so the same human gets
+// the same UID regardless of which OAuth flow they use. Uses HMAC-SHA256 keyed
+// with the server secret to prevent offline email enumeration.
+func demoDeterministicUID(email, secret string) string {
+	canonical := strings.TrimSpace(strings.ToLower(email))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(canonical))
+	return "demo-" + hex.EncodeToString(mac.Sum(nil))[:16]
 }

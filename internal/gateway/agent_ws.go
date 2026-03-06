@@ -62,7 +62,7 @@ func (h *Handler) RequireAgentWebSocketUpgrade(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id query param is required"})
 	}
 
-	device, found, err := h.store.GetDevice(context.Background(), deviceID)
+	device, found, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal_error"})
 	}

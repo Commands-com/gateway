@@ -6,6 +6,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"oss-commands-gateway/internal/httputil"
 	"oss-commands-gateway/internal/jwt"
 )
 
@@ -46,7 +47,7 @@ func (p *Principal) HasScope(scope string) bool {
 
 func RequireUser(jm *jwt.Manager) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		token := bearer(c.Get("Authorization"))
+		token := httputil.BearerToken(c.Get("Authorization"))
 		if token == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing bearer token"})
 		}
@@ -75,7 +76,7 @@ func RequireUser(jm *jwt.Manager) fiber.Handler {
 // whether to return detailed or minimal responses.
 func OptionalUser(jm *jwt.Manager) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		token := bearer(c.Get("Authorization"))
+		token := httputil.BearerToken(c.Get("Authorization"))
 		if token == "" {
 			return c.Next()
 		}
@@ -143,14 +144,3 @@ func normalizeScopes(scopes []string) []string {
 	return clean
 }
 
-func bearer(authHeader string) string {
-	authHeader = strings.TrimSpace(authHeader)
-	if authHeader == "" {
-		return ""
-	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(strings.ToLower(authHeader), strings.ToLower(prefix)) {
-		return ""
-	}
-	return strings.TrimSpace(authHeader[len(prefix):])
-}

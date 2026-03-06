@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+
+	"oss-commands-gateway/internal/httputil"
 )
 
 func (h *Handler) Token(c fiber.Ctx) error {
@@ -52,7 +54,7 @@ func (h *Handler) exchangeAuthorizationCode(c fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "server_error"})
 	}
-	refreshToken, err := randomToken(40)
+	refreshToken, err := httputil.RandomToken(40)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "server_error"})
 	}

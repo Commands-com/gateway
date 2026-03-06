@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"context"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -20,7 +19,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
-	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	route, found, err := h.store.GetIntegrationRoute(c.Context(), routeID)
 	if err != nil {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
@@ -44,7 +43,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	if routeCopy.Status != "active" {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
-	_, leaseFound, err := h.store.GetRouteLease(context.Background(), routeID)
+	_, leaseFound, err := h.store.GetRouteLease(c.Context(), routeID)
 	if err != nil {
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
@@ -59,7 +58,7 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 	}
 
-	if err := h.store.TouchIntegrationRouteLastUsed(context.Background(), routeID, now.Format(time.RFC3339)); err != nil {
+	if err := h.store.TouchIntegrationRouteLastUsed(c.Context(), routeID, now.Format(time.RFC3339)); err != nil {
 		log.Printf("[ingress] route_touch_failed route=%s: %v", routeID, err)
 	}
 

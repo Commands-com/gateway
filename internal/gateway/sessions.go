@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -66,7 +65,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	now := time.Now().UTC()
 	nowUnix := now.Unix()
 
-	device, exists, err := h.store.GetDevice(context.Background(), deviceID)
+	device, exists, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
 	}
@@ -77,7 +76,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	state, found, err := h.store.GetSession(c.Context(), sessionID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 	}
@@ -95,13 +94,13 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 			CreatedAt:                nowUnix,
 			UpdatedAt:                nowUnix,
 		}
-		created, err := h.store.CreateSession(context.Background(), state)
+		created, err := h.store.CreateSession(c.Context(), state)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save session"})
 		}
 		if !created {
 			// A concurrent writer created the session between Get and Create.
-			state, found, err = h.store.GetSession(context.Background(), sessionID)
+			state, found, err = h.store.GetSession(c.Context(), sessionID)
 			if err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 			}
@@ -114,7 +113,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	if sessionPreexisted {
 		payloadConflictErr := errors.New("payload_conflict")
 		conversationConflictErr := errors.New("conversation_conflict")
-		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 			if sess.DeviceID != deviceID || sess.HandshakeID != handshakeID || sess.ClientEphemeralPublicKey != clientEphemeral || sess.ClientSessionNonce != clientNonce {
 				return payloadConflictErr
 			}
@@ -148,7 +147,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 		if err := h.sendToAgentForSession(sessionID, frame); err != nil {
 			relayStatus = "pending_agent_connection"
 			relayError = err.Error()
-			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 				sess.Status = "pending_agent_connection"
 				sess.LastError = relayError
 				sess.UpdatedAt = time.Now().UTC().Unix()
@@ -160,7 +159,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 			state = updated
 		} else {
 			relayStatus = "forwarded_to_agent"
-			updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 				if sess.Status == "pending_agent_connection" {
 					sess.Status = "pending_agent_ack"
 				}
@@ -213,7 +212,7 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	state, found, err := h.store.GetSession(c.Context(), sessionID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 	}
@@ -239,7 +238,7 @@ func (h *Handler) GetHandshake(c fiber.Ctx) error {
 			newStatus = "pending_agent_connection"
 			newError = err.Error()
 		}
-		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 			if sess.HandshakeID != handshakeID {
 				return ErrSessionNotFound
 			}
@@ -312,11 +311,11 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid ephemeral public key"})
 	}
 
-	_, found, err := h.store.GetSession(context.Background(), sessionID)
+	_, found, err := h.store.GetSession(c.Context(), sessionID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 	}
-	device, hasDevice, err := h.store.GetDevice(context.Background(), deviceID)
+	device, hasDevice, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read device"})
 	}
@@ -339,7 +338,7 @@ func (h *Handler) PostHandshakeAgentAck(c fiber.Ctx) error {
 	transcriptMismatchErr := errors.New("transcript_mismatch")
 	signatureErr := errors.New("signature_verification_failed")
 
-	_, err = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+	_, err = h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 		if sess.HandshakeID != handshakeID {
 			return handshakeNotFoundErr
 		}
@@ -441,7 +440,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		payload = make(map[string]any)
 	}
 
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	state, found, err := h.store.GetSession(c.Context(), sessionID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 	}
@@ -543,7 +542,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 	previousSeq := 0
 	if seq > 0 {
 		replayErr := errors.New("replay_detected")
-		updated, err := h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+		updated, err := h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 			if seq <= sess.SeqClientToAgent {
 				return replayErr
 			}
@@ -569,7 +568,7 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 
 	if err := h.sendToAgentForSession(sessionID, payload); err != nil {
 		if reservedSeq > 0 {
-			_, _ = h.store.UpdateSession(context.Background(), sessionID, func(sess *sessionState) error {
+			_, _ = h.store.UpdateSession(c.Context(), sessionID, func(sess *sessionState) error {
 				if sess.SeqClientToAgent == reservedSeq {
 					sess.SeqClientToAgent = previousSeq
 					sess.UpdatedAt = time.Now().UTC().Unix()
@@ -610,7 +609,7 @@ func (h *Handler) GetSessionEvents(c fiber.Ctx) error {
 	}
 	lastEventID := strings.TrimSpace(c.Get("Last-Event-ID"))
 
-	state, found, err := h.store.GetSession(context.Background(), sessionID)
+	state, found, err := h.store.GetSession(c.Context(), sessionID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read session"})
 	}

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ const (
 	maxInviteTTLSeconds     int64 = 90 * 24 * 60 * 60
 	maxEventBacklog               = 1000
 	maxInflightRequests           = 1000
+	sessionSweepInterval          = 5 * time.Minute
+	sessionMaxIdleAge             = 24 * time.Hour
 )
 
 type Handler struct {
@@ -179,7 +182,55 @@ func NewHandlerWithOptions(cfg *config.Config, opts HandlerOptions) *Handler {
 	}
 	h.startInflightSweeper()
 	h.startIdempotencySweeper()
+	h.startSessionSweeper()
 	return h
+}
+
+func (h *Handler) startSessionSweeper() {
+	go func() {
+		ticker := time.NewTicker(sessionSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-h.done:
+				return
+			case now := <-ticker.C:
+				h.sweepStaleSessions(now.UTC())
+			}
+		}
+	}()
+}
+
+func (h *Handler) sweepStaleSessions(now time.Time) {
+	cutoff := now.Add(-sessionMaxIdleAge).Unix()
+	sessions, err := h.store.ListSessions(context.Background())
+	if err != nil {
+		return
+	}
+	for _, sess := range sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.UpdatedAt > cutoff {
+			continue
+		}
+		// Don't reap sessions in an active state — the agent may be
+		// connected on a different node in a multi-node deployment.
+		if isActiveSessionStatus(sess.Status) {
+			continue
+		}
+		_ = h.store.DeleteSessionEvents(context.Background(), sess.SessionID)
+		_ = h.store.DeleteSession(context.Background(), sess.SessionID)
+	}
+}
+
+func isActiveSessionStatus(status string) bool {
+	switch status {
+	case "pending_agent_ack", "pending_agent_connection", "agent_acknowledged":
+		return true
+	default:
+		return false
+	}
 }
 
 // Close stops background sweeper goroutines. Safe to call multiple times.
