@@ -99,7 +99,7 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 		name := strings.Clone(strings.TrimSpace(c.FormValue("demo_name")))
 		if uid == "" && email == "" && name == "" && c.Method() == fiber.MethodGet {
 			_ = c.Type("html")
-			return nil, true, c.SendString(renderDemoLogin(req))
+			return nil, true, c.SendString(renderDemoLogin(req, h.cfg.OAuthClientName))
 		}
 		if email != "" {
 			// Always derive UID from email when available so the same
@@ -122,9 +122,9 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 		if rawIDToken == "" && c.Method() == fiber.MethodGet {
 			_ = c.Type("html")
 			if h.cfg.FirebaseAPIKey != "" && h.cfg.FirebaseProjectID != "" {
-				return nil, true, c.SendString(renderFirebaseLogin(req, h.cfg.FirebaseAPIKey, h.cfg.FirebaseProjectID))
+				return nil, true, c.SendString(renderFirebaseLogin(req, h.cfg.FirebaseAPIKey, h.cfg.FirebaseProjectID, h.cfg.OAuthClientName))
 			}
-			return nil, true, c.SendString(renderIDTokenForm(req, string(h.cfg.AuthMode)))
+			return nil, true, c.SendString(renderIDTokenForm(req, string(h.cfg.AuthMode), h.cfg.OAuthClientName))
 		}
 		if rawIDToken == "" {
 			return nil, false, fmt.Errorf("id token is required")

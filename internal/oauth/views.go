@@ -6,20 +6,28 @@ import (
 	"strings"
 )
 
-func renderDemoLogin(req authorizeRequest) string {
+// commandsLogoSVG is the Commands.com terminal logo (uses currentColor, works on any theme).
+const commandsLogoSVG = `<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" style="width:40px;height:40px;margin-bottom:16px">
+  <rect x="1" y="1" width="30" height="30" rx="4" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <polyline points="9 10 16 16 9 22" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="21" y="8" width="2" height="16" fill="currentColor"><animate attributeName="opacity" values="1;0;1" dur="1s" repeatCount="indefinite"/></rect>
+</svg>`
+
+func renderDemoLogin(req authorizeRequest, gatewayName string) string {
 	hidden := authorizeHiddenInputs(req)
+	escapedName := html.EscapeString(gatewayName)
 	return `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/><title>Sign In — Commands Gateway</title>
+<html lang="en"><head><meta charset="utf-8"/><title>Sign In — ` + escapedName + `</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root { --bg:#0f1117; --surface:#1a1d27; --border:#2e3345; --text:#e1e4ed; --text2:#8b91a5; --accent:#6c8cff; --accent2:#4a6adf; --orange:#f5a623; --radius:8px; }
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:420px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:420px;text-align:center}
 h1{font-size:20px;font-weight:600;margin-bottom:4px}
 .subtitle{color:var(--text2);font-size:14px;margin-bottom:28px}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 10px;border-radius:10px;background:rgba(245,166,35,0.15);color:var(--orange);margin-bottom:16px}
-label{display:block;margin-bottom:16px;font-size:13px;color:var(--text2);font-weight:500}
+label{display:block;margin-bottom:16px;font-size:13px;color:var(--text2);font-weight:500;text-align:left}
 input{display:block;width:100%;margin-top:6px;padding:10px 14px;background:#232734;color:var(--text);border:1px solid var(--border);border-radius:var(--radius);font-size:14px;font-family:inherit;transition:border-color .15s}
 input:focus{outline:none;border-color:var(--accent)}
 button{display:block;width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:15px;font-weight:600;cursor:pointer;transition:background .15s;margin-top:8px}
@@ -29,8 +37,9 @@ button:hover{background:var(--accent2)}
 </style></head>
 <body>
 <div class="card">
+  ` + commandsLogoSVG + `
   <span class="badge">Demo Mode</span>
-  <h1>Commands Gateway</h1>
+  <h1>` + escapedName + `</h1>
   <p class="subtitle">Enter any identity to continue</p>
   <form method="post" action="/oauth/authorize">
     ` + hidden + `
@@ -43,21 +52,22 @@ button:hover{background:var(--accent2)}
 </body></html>`
 }
 
-func renderIDTokenForm(req authorizeRequest, mode string) string {
+func renderIDTokenForm(req authorizeRequest, mode, gatewayName string) string {
 	hidden := authorizeHiddenInputs(req)
 	modeLabel := html.EscapeString(strings.ToUpper(mode))
+	escapedName := html.EscapeString(gatewayName)
 	return `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/><title>Sign In — Commands Gateway</title>
+<html lang="en"><head><meta charset="utf-8"/><title>Sign In — ` + escapedName + `</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root { --bg:#0f1117; --surface:#1a1d27; --border:#2e3345; --text:#e1e4ed; --text2:#8b91a5; --accent:#6c8cff; --accent2:#4a6adf; --radius:8px; }
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:520px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:520px;text-align:center}
 h1{font-size:20px;font-weight:600;margin-bottom:4px}
 .subtitle{color:var(--text2);font-size:14px;margin-bottom:28px}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 10px;border-radius:10px;background:rgba(108,140,255,0.15);color:var(--accent);margin-bottom:16px}
-label{display:block;margin-bottom:16px;font-size:13px;color:var(--text2);font-weight:500}
+label{display:block;margin-bottom:16px;font-size:13px;color:var(--text2);font-weight:500;text-align:left}
 textarea{display:block;width:100%;margin-top:6px;padding:10px 14px;background:#232734;color:var(--text);border:1px solid var(--border);border-radius:var(--radius);font-size:13px;font-family:'SF Mono',Consolas,monospace;resize:vertical;transition:border-color .15s}
 textarea:focus{outline:none;border-color:var(--accent)}
 button{display:block;width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:15px;font-weight:600;cursor:pointer;transition:background .15s;margin-top:8px}
@@ -66,8 +76,9 @@ button:hover{background:var(--accent2)}
 </style></head>
 <body>
 <div class="card">
+  ` + commandsLogoSVG + `
   <span class="badge">` + modeLabel + `</span>
-  <h1>Commands Gateway</h1>
+  <h1>` + escapedName + `</h1>
   <p class="subtitle">Paste a valid ID token to continue</p>
   <form method="post" action="/oauth/authorize">
     ` + hidden + `
@@ -79,12 +90,13 @@ button:hover{background:var(--accent2)}
 </body></html>`
 }
 
-func renderFirebaseLogin(req authorizeRequest, apiKey, projectID string) string {
+func renderFirebaseLogin(req authorizeRequest, apiKey, projectID, gatewayName string) string {
 	hidden := authorizeHiddenInputs(req)
 	escapedAPIKey := html.EscapeString(apiKey)
 	escapedProjectID := html.EscapeString(projectID)
+	escapedName := html.EscapeString(gatewayName)
 	return `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/><title>Sign In — Commands Gateway</title>
+<html lang="en"><head><meta charset="utf-8"/><title>Sign In — ` + escapedName + `</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root { --bg:#0f1117; --surface:#1a1d27; --border:#2e3345; --text:#e1e4ed; --text2:#8b91a5; --accent:#6c8cff; --accent2:#4a6adf; --green:#22c55e; --red:#ef4444; --radius:8px; }
@@ -109,7 +121,8 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 </head>
 <body>
 <div class="card">
-  <h1>Commands Gateway</h1>
+  ` + commandsLogoSVG + `
+  <h1>` + escapedName + `</h1>
   <p class="subtitle">Sign in to connect your agent</p>
   <button class="auth-btn google" onclick="signIn('google')">
     <svg class="auth-icon" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
