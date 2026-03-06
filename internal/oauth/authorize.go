@@ -121,6 +121,9 @@ func (h *Handler) resolveIdentity(c fiber.Ctx, req authorizeRequest) (*idtoken.I
 		))
 		if rawIDToken == "" && c.Method() == fiber.MethodGet {
 			_ = c.Type("html")
+			if h.cfg.FirebaseAPIKey != "" && h.cfg.FirebaseProjectID != "" {
+				return nil, true, c.SendString(renderFirebaseLogin(req, h.cfg.FirebaseAPIKey, h.cfg.FirebaseProjectID))
+			}
 			return nil, true, c.SendString(renderIDTokenForm(req, string(h.cfg.AuthMode)))
 		}
 		if rawIDToken == "" {

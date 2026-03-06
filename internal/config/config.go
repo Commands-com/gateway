@@ -59,6 +59,7 @@ type Config struct {
 
 	FirebaseProjectID       string
 	FirebaseCredentialsPath string
+	FirebaseAPIKey          string
 
 	OIDCIssuerURL string
 	OIDCClientID  string
@@ -108,6 +109,7 @@ func Load() (*Config, error) {
 
 		FirebaseProjectID:       strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID")),
 		FirebaseCredentialsPath: strings.TrimSpace(os.Getenv("FIREBASE_CREDENTIALS_PATH")),
+		FirebaseAPIKey:          strings.TrimSpace(os.Getenv("FIREBASE_API_KEY")),
 
 		OIDCIssuerURL: strings.TrimSpace(os.Getenv("OIDC_ISSUER_URL")),
 		OIDCClientID:  strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID")),
