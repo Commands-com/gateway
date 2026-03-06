@@ -1,6 +1,6 @@
 <div align="center">
 
-# Commands Gateway (OSS)
+# Commands.com Gateway (OSS)
 
 **Deploy your own encrypted relay. Own your infrastructure.**
 
