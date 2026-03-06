@@ -321,51 +321,10 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_route_update", "status must be 'provisioned' or 'inactive'", nil))
 		}
 	}
+	requestedStatus := strings.TrimSpace(req.Status)
+	needsDeactivation := (requestedStatus == "provisioned" || requestedStatus == "inactive") || (validatedDeviceID != "" && validatedDeviceID != route.DeviceID)
 
-	// Perform tunnel deactivation side-effects before the atomic route update.
 	now := time.Now().UTC().Format(time.RFC3339)
-	var deactivatedTunnel *tunnelConn
-	needsDeactivation := false
-	if strings.TrimSpace(req.Status) != "" {
-		status := strings.TrimSpace(req.Status)
-		if status == "provisioned" || status == "inactive" {
-			if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
-				_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-				_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
-				h.mu.Lock()
-				if tc, ok := h.tunnelConns[activeDeviceID]; ok {
-					delete(tc.activatedRoutes, routeID)
-					deactivatedTunnel = tc
-				}
-				h.mu.Unlock()
-				if deactivatedTunnel != nil {
-					h.stopRouteBusSubscription(deactivatedTunnel, routeID)
-				}
-				needsDeactivation = true
-			}
-		}
-	}
-	if validatedDeviceID != "" && validatedDeviceID != route.DeviceID {
-		if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
-			_ = h.store.DeleteActiveRoute(context.Background(), routeID)
-			_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
-			var deviceChangeTunnel *tunnelConn
-			h.mu.Lock()
-			if tc, ok := h.tunnelConns[activeDeviceID]; ok {
-				delete(tc.activatedRoutes, routeID)
-				deviceChangeTunnel = tc
-				if deactivatedTunnel == nil {
-					deactivatedTunnel = tc
-				}
-			}
-			h.mu.Unlock()
-			if deviceChangeTunnel != nil {
-				h.stopRouteBusSubscription(deviceChangeTunnel, routeID)
-			}
-			needsDeactivation = true
-		}
-	}
-	_ = needsDeactivation // suppress unused warning
 
 	// Atomic update with version check
 	updated, err := h.store.UpdateIntegrationRoute(context.Background(), routeID, func(r *integrationRoute) error {
@@ -381,8 +340,8 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		if strings.TrimSpace(req.TokenAuthMode) != "" {
 			r.TokenAuthMode = "path"
 		}
-		if strings.TrimSpace(req.Status) != "" {
-			r.Status = strings.TrimSpace(req.Status)
+		if requestedStatus != "" {
+			r.Status = requestedStatus
 		}
 		if validatedDeviceID != "" && validatedDeviceID != r.DeviceID {
 			if r.Status == "active" {
@@ -405,6 +364,23 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 			return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
 		default:
 			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		}
+	}
+
+	var deactivatedTunnel *tunnelConn
+	if needsDeactivation {
+		if activeDeviceID, active, _ := h.store.GetActiveRouteDevice(context.Background(), routeID); active {
+			_ = h.store.DeleteActiveRoute(context.Background(), routeID)
+			_ = h.store.ReleaseRouteLease(context.Background(), routeID, h.nodeID)
+			h.mu.Lock()
+			if tc, ok := h.tunnelConns[activeDeviceID]; ok {
+				delete(tc.activatedRoutes, routeID)
+				deactivatedTunnel = tc
+			}
+			h.mu.Unlock()
+			if deactivatedTunnel != nil {
+				h.stopRouteBusSubscription(deactivatedTunnel, routeID)
+			}
 		}
 	}
 

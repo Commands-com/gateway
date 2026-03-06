@@ -26,10 +26,11 @@
    - `GET /healthz`
    - `GET /readyz`
 3. Verify OAuth flow (`/oauth/authorize` -> `/oauth/token`).
-4. Verify scope policy:
-   - `gateway:share` routes reject tokens without `gateway:share`.
-   - `gateway:session` routes reject tokens without `gateway:session`.
-   - device routes reject tokens without `device`.
+4. Verify auth/scope policy:
+   - `PUT /gateway/v1/devices/:device_id/identity-key` rejects tokens without `device`.
+   - `POST /gateway/v1/sessions/:session_id/handshake/agent-ack` rejects tokens without `device`.
+   - `/gateway/v1/agent/connect` and `/gateway/v1/integrations/tunnel/connect` reject tokens without `device`.
+   - user-authenticated gateway routes do not require `gateway:share` or `gateway:session`.
 5. Verify reconnect behavior:
    - agent websocket replacement on same `device_id`.
    - tunnel websocket replacement on same `device_id`.

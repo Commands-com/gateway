@@ -57,6 +57,17 @@ curl -s http://localhost:8080/healthz
 curl -s http://localhost:8080/readyz
 ```
 
+### Out-Of-The-Box Local Run (Commands Desktop Compatible)
+
+```bash
+export JWT_SIGNING_KEY="$(openssl rand -hex 32)"
+PORT=8091 PUBLIC_BASE_URL=http://localhost:8091 AUTH_MODE=demo STATE_BACKEND=memory \
+OAUTH_DEFAULT_CLIENT_ID=commands-desktop-public \
+REDIRECT_ALLOWLIST='http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob' \
+OAUTH_REDIRECT_URIS='http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob' \
+go run ./cmd/server
+```
+
 ## Commands.com Desktop Compatibility
 
 If you are pairing this OSS gateway with the current commands.com desktop app, set:
@@ -94,19 +105,14 @@ OAUTH_REDIRECT_URIS=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
 
 ## Scope Policy
 
-Gateway routes are scope-gated:
+Gateway routes require an authenticated user token.
+Only device registration, agent handshake ack, and websocket agent/tunnel connect enforce `device` scope:
 
 - `device`
   - `PUT /gateway/v1/devices/:device_id/identity-key`
   - `POST /gateway/v1/sessions/:session_id/handshake/agent-ack`
   - `GET /gateway/v1/agent/connect` (WebSocket)
   - `GET /gateway/v1/integrations/tunnel/connect` (WebSocket)
-- `gateway:session`
-  - session handshake/read/message/events routes
-  - `GET /gateway/v1/devices/:device_id/identity-key`
-- `gateway:share`
-  - all `/gateway/v1/shares/*` routes
-  - all `/gateway/v1/integrations/routes*` routes
 
 ## Ingress Rate Limits
 

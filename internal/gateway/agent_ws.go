@@ -67,11 +67,11 @@ func (h *Handler) RequireAgentWebSocketUpgrade(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal_error"})
 	}
 	h.mu.RLock()
-	ownerConnCount := 0
-	for did, conn := range h.agents {
-		if conn.ownerUID == principal.UID && did != deviceID {
-			ownerConnCount++
-		}
+	ownerConnCount := h.agentConnCountByOwner[principal.UID]
+	// Exclude reconnects for this device so replacing an existing connection
+	// does not count against the owner's cap.
+	if existing, ok := h.agents[deviceID]; ok && existing.ownerUID == principal.UID && ownerConnCount > 0 {
+		ownerConnCount--
 	}
 	h.mu.RUnlock()
 	if !found {
@@ -140,11 +140,9 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 
 	var replaced *agentConn
 	h.mu.Lock()
-	ownerConnCount := 0
-	for did, existing := range h.agents {
-		if existing.ownerUID == ownerUID && did != deviceID {
-			ownerConnCount++
-		}
+	ownerConnCount := h.agentConnCountByOwner[ownerUID]
+	if existing, ok := h.agents[deviceID]; ok && existing.ownerUID == ownerUID && ownerConnCount > 0 {
+		ownerConnCount--
 	}
 	if ownerConnCount >= maxAgentConnectionsPerOwner {
 		h.mu.Unlock()
@@ -158,8 +156,13 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 	}
 	if existing, ok := h.agents[deviceID]; ok {
 		replaced = existing
+		h.agentConnCountByOwner[existing.ownerUID]--
+		if h.agentConnCountByOwner[existing.ownerUID] <= 0 {
+			delete(h.agentConnCountByOwner, existing.ownerUID)
+		}
 	}
 	h.agents[deviceID] = state
+	h.agentConnCountByOwner[ownerUID]++
 	h.mu.Unlock()
 
 	if replaced != nil && replaced != state {
@@ -185,6 +188,10 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 			h.mu.Lock()
 			if current, ok := h.agents[deviceID]; ok && current == state {
 				delete(h.agents, deviceID)
+				h.agentConnCountByOwner[ownerUID]--
+				if h.agentConnCountByOwner[ownerUID] <= 0 {
+					delete(h.agentConnCountByOwner, ownerUID)
+				}
 			}
 			h.mu.Unlock()
 			_ = c.Close()
@@ -221,6 +228,10 @@ func (h *Handler) handleAgentConnect(c *websocket.Conn) {
 	h.mu.Lock()
 	if current, ok := h.agents[deviceID]; ok && current == state {
 		delete(h.agents, deviceID)
+		h.agentConnCountByOwner[ownerUID]--
+		if h.agentConnCountByOwner[ownerUID] <= 0 {
+			delete(h.agentConnCountByOwner, ownerUID)
+		}
 	}
 	h.mu.Unlock()
 	_ = c.Close()
@@ -579,6 +590,10 @@ func (h *Handler) sendToAgentForSession(sessionID string, payload map[string]any
 		h.mu.Lock()
 		if current, ok := h.agents[deviceID]; ok && current == conn {
 			delete(h.agents, deviceID)
+			h.agentConnCountByOwner[current.ownerUID]--
+			if h.agentConnCountByOwner[current.ownerUID] <= 0 {
+				delete(h.agentConnCountByOwner, current.ownerUID)
+			}
 		}
 		h.mu.Unlock()
 		_ = conn.conn.Close()

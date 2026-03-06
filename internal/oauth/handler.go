@@ -71,7 +71,7 @@ func (h *Handler) WellKnown(c fiber.Ctx) error {
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
 		"token_endpoint_auth_methods_supported": []string{"none"},
 		"code_challenge_methods_supported":      []string{"S256", "plain"},
-		"scopes_supported":                      []string{"openid", "profile", "email", "device", "gateway:session", "gateway:share"},
+		"scopes_supported":                      []string{"openid", "profile", "email", "device"},
 	})
 }
 

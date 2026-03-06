@@ -120,6 +120,61 @@ paths:
         '200':
           description: OK
 
+  /gateway/v1/devices:
+    get:
+      summary: List visible devices
+      description: Requires authenticated user token.
+      responses:
+        '200':
+          description: Device list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        device_id: { type: string }
+                        display_name: { type: string }
+                        name: { type: string }
+                        owner_uid: { type: string }
+                        owner_email: { type: string }
+                        algorithm: { type: string, enum: [ed25519] }
+                        status: { type: string, enum: [online, offline] }
+                        connected: { type: boolean }
+                        updated_at:
+                          type: string
+                          format: date-time
+                        connected_at:
+                          type: string
+                          format: date-time
+                        last_seen_at:
+                          type: string
+                          format: date-time
+                        device_class: { type: string }
+                        role: { type: string, enum: [owner, collaborator] }
+        '401':
+          description: Unauthorized
+
+  /gateway/v1/devices/events:
+    get:
+      summary: Stream device status events (SSE)
+      description: |
+        Requires authenticated user token.
+        Returns `text/event-stream` with heartbeat comments and `device_status` events.
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          description: Unauthorized
+
   /gateway/v1/devices/{device_id}/identity-key:
     put:
       summary: Register or update device identity key

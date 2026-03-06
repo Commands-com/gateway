@@ -25,10 +25,12 @@ type Handler struct {
 	nodeID string
 	subs   map[string]map[*sseSubscriber]struct{}
 
-	agents map[string]*agentConn
+	agents                map[string]*agentConn
+	agentConnCountByOwner map[string]int
 
-	tunnelConns      map[string]*tunnelConn
-	inflightRequests map[string]*inflightRequest
+	tunnelConns            map[string]*tunnelConn
+	tunnelConnCountByOwner map[string]int
+	inflightRequests       map[string]*inflightRequest
 
 	idempotencyMu   sync.Mutex
 	idempotencyKeys map[string]time.Time
@@ -152,19 +154,21 @@ func NewHandlerWithOptions(cfg *config.Config, opts HandlerOptions) *Handler {
 	}
 
 	h := &Handler{
-		cfg:                  cfg,
-		mu:                   &sync.RWMutex{},
-		store:                store,
-		bus:                  bus,
-		nodeID:               nodeID,
-		subs:                 make(map[string]map[*sseSubscriber]struct{}),
-		agents:               make(map[string]*agentConn),
-		tunnelConns:          make(map[string]*tunnelConn),
-		inflightRequests:     make(map[string]*inflightRequest),
-		idempotencyKeys:      make(map[string]time.Time),
-		transportTokenIssuer: transportTokenIssuer,
-		transportTokenTTL:    transportTokenTTL,
-		done:                 make(chan struct{}),
+		cfg:                    cfg,
+		mu:                     &sync.RWMutex{},
+		store:                  store,
+		bus:                    bus,
+		nodeID:                 nodeID,
+		subs:                   make(map[string]map[*sseSubscriber]struct{}),
+		agents:                 make(map[string]*agentConn),
+		agentConnCountByOwner:  make(map[string]int),
+		tunnelConns:            make(map[string]*tunnelConn),
+		tunnelConnCountByOwner: make(map[string]int),
+		inflightRequests:       make(map[string]*inflightRequest),
+		idempotencyKeys:        make(map[string]time.Time),
+		transportTokenIssuer:   transportTokenIssuer,
+		transportTokenTTL:      transportTokenTTL,
+		done:                   make(chan struct{}),
 	}
 
 	h.agentWriteFn = func(ac *agentConn, payload map[string]any) error {

@@ -228,7 +228,7 @@ func isLoopbackHTTPRedirect(u *url.URL) bool {
 func normalizeScope(scope string) string {
 	clean := strings.Fields(strings.TrimSpace(scope))
 	if len(clean) == 0 {
-		return "openid profile email gateway:session gateway:share"
+		return "openid profile email device"
 	}
 	return strings.Join(clean, " ")
 }

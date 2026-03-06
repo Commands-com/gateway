@@ -22,7 +22,19 @@ var (
 	ErrSessionVersionConflict = errors.New("session_version_conflict")
 	ErrRouteNotFound          = errors.New("route_not_found")
 	ErrRouteVersionConflict   = errors.New("route_version_conflict")
+	ErrInviteNotFound         = errors.New("invite_not_found")
+	ErrInviteGrantNotFound    = errors.New("invite_grant_not_found")
+	ErrInviteExpired          = errors.New("invite_expired")
+	ErrInviteEmailMismatch    = errors.New("invite_email_mismatch")
 )
+
+type InviteStatusError struct {
+	Status string
+}
+
+func (e *InviteStatusError) Error() string {
+	return "invite_status:" + e.Status
+}
 
 type StateStore interface {
 	// Devices
@@ -48,6 +60,7 @@ type StateStore interface {
 	SaveInviteGrantMapping(ctx context.Context, tokenHash, grantID string) error
 	GetInviteGrantID(ctx context.Context, tokenHash string) (string, bool, error)
 	DeleteInviteGrantMapping(ctx context.Context, tokenHash string) error
+	AcceptShareInviteAtomic(ctx context.Context, tokenHash, acceptorUID, acceptorEmail, granteeDeviceID string, now int64) (*shareGrant, error)
 
 	// Integration routes
 	SaveIntegrationRoute(ctx context.Context, route *integrationRoute) error
@@ -256,10 +269,20 @@ func (s *InMemoryStateStore) SaveShareGrant(_ context.Context, grant *shareGrant
 	stored := cloneShareGrant(grant)
 	old, hadOld := s.grants[grant.GrantID]
 	s.grants[grant.GrantID] = stored
-	s.rebuildGrantsByDeviceLocked(stored.DeviceID)
-	if hadOld && old != nil && old.DeviceID != "" && old.DeviceID != stored.DeviceID {
-		s.rebuildGrantsByDeviceLocked(old.DeviceID)
+	oldDeviceID := ""
+	if hadOld && old != nil {
+		oldDeviceID = old.DeviceID
 	}
+	if stored.DeviceID == "" {
+		if oldDeviceID != "" {
+			s.removeShareGrantFromDeviceIndexLocked(oldDeviceID, stored.GrantID)
+		}
+		return nil
+	}
+	if oldDeviceID != "" && oldDeviceID != stored.DeviceID {
+		s.removeShareGrantFromDeviceIndexLocked(oldDeviceID, stored.GrantID)
+	}
+	s.putShareGrantInDeviceIndexLocked(stored.DeviceID, stored)
 	return nil
 }
 
@@ -318,25 +341,7 @@ func (s *InMemoryStateStore) ListAllShareGrantsByDevice(_ context.Context, devic
 func (s *InMemoryStateStore) DeleteShareGrantFromDeviceIndex(_ context.Context, deviceID, grantID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if deviceID == "" || grantID == "" {
-		return nil
-	}
-	grants := s.grantsByDevice[deviceID]
-	if len(grants) == 0 {
-		return nil
-	}
-	filtered := grants[:0]
-	for _, grant := range grants {
-		if grant == nil || grant.GrantID == grantID {
-			continue
-		}
-		filtered = append(filtered, grant)
-	}
-	if len(filtered) == 0 {
-		delete(s.grantsByDevice, deviceID)
-		return nil
-	}
-	s.grantsByDevice[deviceID] = filtered
+	s.removeShareGrantFromDeviceIndexLocked(deviceID, grantID)
 	return nil
 }
 
@@ -359,6 +364,48 @@ func (s *InMemoryStateStore) DeleteInviteGrantMapping(_ context.Context, tokenHa
 	defer s.mu.Unlock()
 	delete(s.inviteToID, tokenHash)
 	return nil
+}
+
+func (s *InMemoryStateStore) AcceptShareInviteAtomic(_ context.Context, tokenHash, acceptorUID, acceptorEmail, granteeDeviceID string, now int64) (*shareGrant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	grantID, ok := s.inviteToID[tokenHash]
+	if !ok {
+		return nil, ErrInviteNotFound
+	}
+
+	grant, ok := s.grants[grantID]
+	if !ok || grant == nil {
+		delete(s.inviteToID, tokenHash)
+		return nil, ErrInviteGrantNotFound
+	}
+
+	if grant.Status != "pending" {
+		return nil, &InviteStatusError{Status: grant.Status}
+	}
+
+	if grant.InviteTokenExpiresAt > 0 && now > grant.InviteTokenExpiresAt {
+		grant.Status = "expired"
+		grant.UpdatedAt = now
+		delete(s.inviteToID, tokenHash)
+		return nil, ErrInviteExpired
+	}
+
+	if grant.GranteeEmail != "" && grant.GranteeEmail != acceptorEmail {
+		return nil, ErrInviteEmailMismatch
+	}
+
+	grant.Status = "active"
+	grant.GranteeUID = acceptorUID
+	grant.AcceptedAt = now
+	grant.UpdatedAt = now
+	if granteeDeviceID != "" {
+		grant.GranteeDeviceID = granteeDeviceID
+	}
+	delete(s.inviteToID, tokenHash)
+
+	return cloneShareGrant(grant), nil
 }
 
 func (s *InMemoryStateStore) SaveIntegrationRoute(_ context.Context, route *integrationRoute) error {
@@ -704,20 +751,40 @@ func cloneIntegrationRoute(route *integrationRoute) *integrationRoute {
 	return &cloned
 }
 
-func (s *InMemoryStateStore) rebuildGrantsByDeviceLocked(deviceID string) {
-	if deviceID == "" {
+func (s *InMemoryStateStore) putShareGrantInDeviceIndexLocked(deviceID string, grant *shareGrant) {
+	if deviceID == "" || grant == nil || grant.GrantID == "" {
 		return
 	}
-	out := make([]*shareGrant, 0)
-	for _, grant := range s.grants {
-		if grant == nil || grant.DeviceID != deviceID {
+	grants := s.grantsByDevice[deviceID]
+	filtered := grants[:0]
+	for _, existing := range grants {
+		if existing == nil || existing.GrantID == grant.GrantID {
 			continue
 		}
-		out = append(out, grant)
+		filtered = append(filtered, existing)
 	}
-	if len(out) == 0 {
+	filtered = append(filtered, grant)
+	s.grantsByDevice[deviceID] = filtered
+}
+
+func (s *InMemoryStateStore) removeShareGrantFromDeviceIndexLocked(deviceID, grantID string) {
+	if deviceID == "" || grantID == "" {
+		return
+	}
+	grants := s.grantsByDevice[deviceID]
+	if len(grants) == 0 {
+		return
+	}
+	filtered := grants[:0]
+	for _, grant := range grants {
+		if grant == nil || grant.GrantID == grantID {
+			continue
+		}
+		filtered = append(filtered, grant)
+	}
+	if len(filtered) == 0 {
 		delete(s.grantsByDevice, deviceID)
 		return
 	}
-	s.grantsByDevice[deviceID] = out
+	s.grantsByDevice[deviceID] = filtered
 }

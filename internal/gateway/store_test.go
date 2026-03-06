@@ -149,3 +149,116 @@ func TestInMemoryStoreReturnsCopiesForMutableRecords(t *testing.T) {
 		t.Fatalf("expected stored grant status to remain active, got %s", reloadedGrant.Status)
 	}
 }
+
+func TestInMemoryStoreAcceptShareInviteAtomicSingleUse(t *testing.T) {
+	store := NewInMemoryStateStore()
+	ctx := context.Background()
+	now := int64(1_700_000_000)
+
+	grant := &shareGrant{
+		GrantID:              "gr_invite_atomic",
+		DeviceID:             "dev1",
+		OwnerUID:             "owner1",
+		GranteeEmail:         "invitee@example.com",
+		Status:               "pending",
+		InviteTokenHash:      "tokenhash",
+		InviteTokenExpiresAt: now + 300,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}
+	if err := store.SaveShareGrant(ctx, grant); err != nil {
+		t.Fatalf("save grant failed: %v", err)
+	}
+	if err := store.SaveInviteGrantMapping(ctx, "tokenhash", grant.GrantID); err != nil {
+		t.Fatalf("save invite mapping failed: %v", err)
+	}
+
+	accepted, err := store.AcceptShareInviteAtomic(ctx, "tokenhash", "invitee-uid", "invitee@example.com", "invitee-device", now+1)
+	if err != nil {
+		t.Fatalf("accept invite failed: %v", err)
+	}
+	if accepted.Status != "active" {
+		t.Fatalf("expected accepted status active, got %s", accepted.Status)
+	}
+	if accepted.GranteeUID != "invitee-uid" {
+		t.Fatalf("expected grantee uid invitee-uid, got %s", accepted.GranteeUID)
+	}
+	if accepted.GranteeDeviceID != "invitee-device" {
+		t.Fatalf("expected grantee device invitee-device, got %s", accepted.GranteeDeviceID)
+	}
+
+	_, err = store.AcceptShareInviteAtomic(ctx, "tokenhash", "invitee-uid", "invitee@example.com", "", now+2)
+	if !errors.Is(err, ErrInviteNotFound) {
+		t.Fatalf("expected ErrInviteNotFound on second accept, got %v", err)
+	}
+}
+
+func TestInMemoryStoreSaveShareGrantMaintainsDeviceIndexIncrementally(t *testing.T) {
+	store := NewInMemoryStateStore()
+	ctx := context.Background()
+	grant := &shareGrant{
+		GrantID:      "gr_idx",
+		DeviceID:     "dev_a",
+		OwnerUID:     "owner1",
+		GranteeUID:   "user1",
+		GranteeEmail: "user1@example.com",
+		Status:       "pending",
+	}
+
+	if err := store.SaveShareGrant(ctx, grant); err != nil {
+		t.Fatalf("save initial grant failed: %v", err)
+	}
+	grantsA, err := store.ListShareGrantsByDevice(ctx, "dev_a")
+	if err != nil {
+		t.Fatalf("list grants by device A failed: %v", err)
+	}
+	if len(grantsA) != 1 || grantsA[0].GrantID != grant.GrantID {
+		t.Fatalf("expected one indexed grant on device A, got %+v", grantsA)
+	}
+
+	grant.Status = "active"
+	if err := store.SaveShareGrant(ctx, grant); err != nil {
+		t.Fatalf("save updated grant failed: %v", err)
+	}
+	grantsA, err = store.ListShareGrantsByDevice(ctx, "dev_a")
+	if err != nil {
+		t.Fatalf("list grants by device A after update failed: %v", err)
+	}
+	if len(grantsA) != 1 {
+		t.Fatalf("expected one indexed grant on device A after update, got %d", len(grantsA))
+	}
+	if grantsA[0].Status != "active" {
+		t.Fatalf("expected updated status in device A index, got %s", grantsA[0].Status)
+	}
+
+	grant.DeviceID = "dev_b"
+	if err := store.SaveShareGrant(ctx, grant); err != nil {
+		t.Fatalf("save moved grant failed: %v", err)
+	}
+	grantsA, err = store.ListShareGrantsByDevice(ctx, "dev_a")
+	if err != nil {
+		t.Fatalf("list grants by device A after move failed: %v", err)
+	}
+	if len(grantsA) != 0 {
+		t.Fatalf("expected device A index to be empty after move, got %d", len(grantsA))
+	}
+	grantsB, err := store.ListShareGrantsByDevice(ctx, "dev_b")
+	if err != nil {
+		t.Fatalf("list grants by device B failed: %v", err)
+	}
+	if len(grantsB) != 1 || grantsB[0].GrantID != grant.GrantID {
+		t.Fatalf("expected one indexed grant on device B, got %+v", grantsB)
+	}
+
+	grant.DeviceID = ""
+	if err := store.SaveShareGrant(ctx, grant); err != nil {
+		t.Fatalf("save grant with empty device failed: %v", err)
+	}
+	grantsB, err = store.ListShareGrantsByDevice(ctx, "dev_b")
+	if err != nil {
+		t.Fatalf("list grants by device B after clearing device failed: %v", err)
+	}
+	if len(grantsB) != 0 {
+		t.Fatalf("expected device B index to be empty after clearing device, got %d", len(grantsB))
+	}
+}

@@ -211,14 +211,104 @@ func TestIngressRejectsWhenLeaseOwnedByRemoteNode(t *testing.T) {
 		t.Fatalf("ingress request failed: %v", err)
 	}
 	defer resp.Body.Close()
-	// When the lease is owned by a remote node, the request is forwarded via
-	// the MessageBus rather than rejected immediately. With no remote node
-	// subscribed, the request will timeout at the route deadline.
-	if resp.StatusCode != fiber.StatusGatewayTimeout {
-		t.Fatalf("expected 504 (gateway timeout via cross-node routing) when lease is owned by remote node, got %d", resp.StatusCode)
+	// When the lease is owned by a remote node but there is no subscriber for
+	// the route on the bus, ingress should fail fast rather than timing out.
+	if resp.StatusCode != fiber.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when lease is owned by remote node with no subscriber, got %d", resp.StatusCode)
 	}
 	if calls != 0 {
 		t.Fatalf("expected local tunnel dispatch not to run when lease owner is remote")
+	}
+}
+
+type conflictRouteUpdateStore struct {
+	StateStore
+	conflictRouteID string
+}
+
+func (s *conflictRouteUpdateStore) UpdateIntegrationRoute(ctx context.Context, routeID string, mutateFn IntegrationRouteMutator) (*integrationRoute, error) {
+	if routeID == s.conflictRouteID {
+		return nil, ErrRouteVersionConflict
+	}
+	return s.StateStore.UpdateIntegrationRoute(ctx, routeID, mutateFn)
+}
+
+func TestUpdateIntegrationRouteConflictDoesNotDeactivateTunnelState(t *testing.T) {
+	baseStore := NewInMemoryStateStore()
+	h := NewHandlerWithOptions(
+		&config.Config{
+			FrontendURL:   "https://frontend.example",
+			StateBackend:  config.StateBackendMemory,
+			PublicBaseURL: "http://localhost:8080",
+		},
+		HandlerOptions{Store: baseStore},
+	)
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	routeID, _ := routeObj["route_id"].(string)
+	if routeID == "" {
+		t.Fatalf("expected route_id in create response")
+	}
+
+	route, found, err := baseStore.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || route == nil {
+		t.Fatalf("expected route to exist, found=%v err=%v", found, err)
+	}
+	route.Status = "active"
+	route.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := baseStore.SaveIntegrationRoute(context.Background(), route); err != nil {
+		t.Fatalf("save route failed: %v", err)
+	}
+	if err := baseStore.SetActiveRouteDevice(context.Background(), routeID, "devowner1"); err != nil {
+		t.Fatalf("set active route failed: %v", err)
+	}
+	if _, ok, err := baseStore.ClaimRouteLease(context.Background(), routeID, h.nodeID, routeLeaseTTL); err != nil || !ok {
+		t.Fatalf("expected route lease claim to succeed, err=%v", err)
+	}
+
+	tc := &tunnelConn{
+		deviceID:        "devowner1",
+		ownerUID:        "owner1",
+		activatedRoutes: map[string]bool{routeID: true},
+	}
+	h.mu.Lock()
+	h.tunnelConns[tc.deviceID] = tc
+	h.mu.Unlock()
+
+	h.store = &conflictRouteUpdateStore{
+		StateStore:      baseStore,
+		conflictRouteID: routeID,
+	}
+
+	mustDoJSON(t, app, "PUT", "/gateway/v1/integrations/routes/"+routeID, map[string]any{
+		"status": "inactive",
+	}, "owner1", "owner@example.com", fiber.StatusConflict)
+
+	activeDeviceID, active, err := baseStore.GetActiveRouteDevice(context.Background(), routeID)
+	if err != nil {
+		t.Fatalf("get active route failed: %v", err)
+	}
+	if !active || activeDeviceID != "devowner1" {
+		t.Fatalf("expected active route binding to remain, active=%v device=%s", active, activeDeviceID)
+	}
+
+	h.mu.RLock()
+	_, stillActivated := tc.activatedRoutes[routeID]
+	h.mu.RUnlock()
+	if !stillActivated {
+		t.Fatalf("expected tunnel activated route to remain after conflict")
 	}
 }
 

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -111,7 +112,8 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 	if principal == nil {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
-	if canonicalEmail(principal.Email) == "" {
+	acceptorEmail := canonicalEmail(principal.Email)
+	if acceptorEmail == "" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "email is required to accept invites"})
 	}
 
@@ -123,38 +125,7 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 	if token == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "token is required"})
 	}
-
-	now := time.Now().UTC().Unix()
-	tokenHash := hashToken(token)
-	grantID, ok, err := h.store.GetInviteGrantID(context.Background(), tokenHash)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read invite"})
-	}
-	if !ok {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found or already used"})
-	}
-	grant, found, err := h.store.GetShareGrant(context.Background(), grantID)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grant"})
-	}
-	if !found {
-		_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found"})
-	}
-	if grant.Status != "pending" {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("invite is %s", grant.Status)})
-	}
-	if grant.InviteTokenExpiresAt > 0 && now > grant.InviteTokenExpiresAt {
-		grant.Status = "expired"
-		grant.UpdatedAt = now
-		// Persist the expired status and clean up the invite mapping
-		_ = h.store.SaveShareGrant(context.Background(), grant)
-		_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
-		return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "invite has expired"})
-	}
-	if grant.GranteeEmail != "" && grant.GranteeEmail != canonicalEmail(principal.Email) {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "email does not match this invite"})
-	}
+	granteeDeviceID := ""
 	if strings.TrimSpace(req.DeviceID) != "" {
 		deviceID, err := validateID(req.DeviceID, "deviceId")
 		if err != nil {
@@ -167,18 +138,30 @@ func (h *Handler) AcceptShareInvite(c fiber.Ctx) error {
 		if !exists || rec.OwnerUID != principal.UID {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 		}
-		grant.GranteeDeviceID = deviceID
+		granteeDeviceID = deviceID
 	}
 
-	grant.Status = "active"
-	grant.GranteeUID = principal.UID
-	grant.AcceptedAt = now
-	grant.UpdatedAt = now
-	if err := h.store.SaveShareGrant(context.Background(), grant); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
+	now := time.Now().UTC().Unix()
+	tokenHash := hashToken(token)
+	grant, err := h.store.AcceptShareInviteAtomic(context.Background(), tokenHash, principal.UID, acceptorEmail, granteeDeviceID, now)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInviteNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found or already used"})
+		case errors.Is(err, ErrInviteGrantNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "invite not found"})
+		case errors.Is(err, ErrInviteExpired):
+			return c.Status(fiber.StatusGone).JSON(fiber.Map{"error": "invite has expired"})
+		case errors.Is(err, ErrInviteEmailMismatch):
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "email does not match this invite"})
+		default:
+			var statusErr *InviteStatusError
+			if errors.As(err, &statusErr) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": fmt.Sprintf("invite is %s", statusErr.Status)})
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to accept invite"})
+		}
 	}
-	// Remove the invite token mapping now that it has been consumed
-	_ = h.store.DeleteInviteGrantMapping(context.Background(), tokenHash)
 
 	return c.JSON(fiber.Map{
 		"grantId":  grant.GrantID,

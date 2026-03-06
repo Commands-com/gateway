@@ -25,6 +25,7 @@ const (
 	wsReadDeadline               = 60 * time.Second
 	inflightSweepInterval        = 10 * time.Second
 	inflightRequestMaxAge        = 2 * time.Minute
+	tunnelBusPublishTimeout      = 250 * time.Millisecond
 	routeLeaseTTL                = 15 * time.Second
 	routeLeaseRenewEvery         = 5 * time.Second
 	maxTunnelConnectionsPerOwner = 50
@@ -107,11 +108,9 @@ func (h *Handler) RequireIntegrationTunnelUpgrade(c fiber.Ctx) error {
 
 	// Enforce per-owner tunnel connection limit (excluding reconnects for the same device)
 	h.mu.RLock()
-	ownerTunnelCount := 0
-	for did, conn := range h.tunnelConns {
-		if conn.ownerUID == principal.UID && did != deviceID {
-			ownerTunnelCount++
-		}
+	ownerTunnelCount := h.tunnelConnCountByOwner[principal.UID]
+	if existing, ok := h.tunnelConns[deviceID]; ok && existing.ownerUID == principal.UID && ownerTunnelCount > 0 {
+		ownerTunnelCount--
 	}
 	h.mu.RUnlock()
 	if ownerTunnelCount >= maxTunnelConnectionsPerOwner {
@@ -166,11 +165,9 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	h.mu.Lock()
 	// Re-check per-owner tunnel connection limit under write lock to prevent
 	// concurrent connection attempts from exceeding the limit.
-	ownerTunnelCount := 0
-	for did, conn := range h.tunnelConns {
-		if conn.ownerUID == ownerUID && did != deviceID {
-			ownerTunnelCount++
-		}
+	ownerTunnelCount := h.tunnelConnCountByOwner[ownerUID]
+	if existing, ok := h.tunnelConns[deviceID]; ok && existing.ownerUID == ownerUID && ownerTunnelCount > 0 {
+		ownerTunnelCount--
 	}
 	if ownerTunnelCount >= maxTunnelConnectionsPerOwner {
 		h.mu.Unlock()
@@ -184,8 +181,13 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	}
 	if existing, ok := h.tunnelConns[deviceID]; ok {
 		replaced = existing
+		h.tunnelConnCountByOwner[existing.ownerUID]--
+		if h.tunnelConnCountByOwner[existing.ownerUID] <= 0 {
+			delete(h.tunnelConnCountByOwner, existing.ownerUID)
+		}
 	}
 	h.tunnelConns[deviceID] = state
+	h.tunnelConnCountByOwner[ownerUID]++
 	h.mu.Unlock()
 
 	if replaced != nil && replaced != state {
@@ -258,6 +260,10 @@ func (h *Handler) handleTunnelConnect(c *websocket.Conn) {
 	h.mu.Lock()
 	if current, ok := h.tunnelConns[deviceID]; ok && current == state {
 		delete(h.tunnelConns, deviceID)
+		h.tunnelConnCountByOwner[ownerUID]--
+		if h.tunnelConnCountByOwner[ownerUID] <= 0 {
+			delete(h.tunnelConnCountByOwner, ownerUID)
+		}
 		h.removeInflightRequestsForDeviceLocked(deviceID)
 		wasActive = true
 	}
@@ -1069,9 +1075,21 @@ func (h *Handler) sendTunnelRequest(routeID string, requestFrame map[string]any)
 		ReceivedAt:      time.Now().UTC(),
 	}
 
-	if err := h.bus.PublishTunnelRequest(context.Background(), routeID, busReq); err != nil {
+	publishTimeout := tunnelBusPublishTimeout
+	if waitTimeout > 0 && waitTimeout < publishTimeout {
+		publishTimeout = waitTimeout
+	}
+	if publishTimeout <= 0 {
+		publishTimeout = tunnelBusPublishTimeout
+	}
+	publishCtx, publishCancel := context.WithTimeout(context.Background(), publishTimeout)
+	defer publishCancel()
+	if err := h.bus.PublishTunnelRequest(publishCtx, routeID, busReq); err != nil {
 		cancel()
 		unsub()
+		if errors.Is(err, ErrMessageBusNoSubscribers) || errors.Is(err, ErrMessageBusBackpressure) {
+			return nil, fmt.Errorf("tunnel_dispatch_unavailable: %w", err)
+		}
 		return nil, fmt.Errorf("cross_node_publish_failed: %w", err)
 	}
 

@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -42,6 +44,11 @@ type MessageBus interface {
 	SubscribeTunnelResponses(ctx context.Context, requestID string, ch chan<- TunnelResponseMessage) (unsubscribe func(), err error)
 }
 
+var (
+	ErrMessageBusNoSubscribers = errors.New("message_bus_no_subscribers")
+	ErrMessageBusBackpressure  = errors.New("message_bus_backpressure")
+)
+
 type InMemoryMessageBus struct {
 	mu sync.RWMutex
 
@@ -73,12 +80,22 @@ func (b *InMemoryMessageBus) SubscribeSessionEvents(ctx context.Context, session
 	return b.subscribeSession(ctx, sessionID, ch), nil
 }
 
-func (b *InMemoryMessageBus) PublishTunnelRequest(_ context.Context, routeID string, req TunnelRequestMessage) error {
+func (b *InMemoryMessageBus) PublishTunnelRequest(ctx context.Context, routeID string, req TunnelRequestMessage) error {
 	subs := b.snapshotTunnelReqSubs(routeID)
+	if len(subs) == 0 {
+		return ErrMessageBusNoSubscribers
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, ch := range subs {
 		select {
 		case ch <- req:
-		default:
+		case <-ctx.Done():
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("%w: %v", ErrMessageBusBackpressure, err)
+			}
+			return ErrMessageBusBackpressure
 		}
 	}
 	return nil
