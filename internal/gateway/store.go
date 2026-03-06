@@ -28,6 +28,7 @@ type StateStore interface {
 	// Devices
 	SaveDevice(ctx context.Context, dev deviceRecord) error
 	GetDevice(ctx context.Context, deviceID string) (deviceRecord, bool, error)
+	ListDevices(ctx context.Context) ([]deviceRecord, error)
 
 	// Sessions
 	CreateSession(ctx context.Context, sess *sessionState) (bool, error)
@@ -127,6 +128,16 @@ func (s *InMemoryStateStore) GetDevice(_ context.Context, deviceID string) (devi
 	defer s.mu.RUnlock()
 	dev, ok := s.devices[deviceID]
 	return dev, ok, nil
+}
+
+func (s *InMemoryStateStore) ListDevices(_ context.Context) ([]deviceRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]deviceRecord, 0, len(s.devices))
+	for _, dev := range s.devices {
+		out = append(out, dev)
+	}
+	return out, nil
 }
 
 func (s *InMemoryStateStore) CreateSession(_ context.Context, sess *sessionState) (bool, error) {

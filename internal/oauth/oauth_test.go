@@ -82,6 +82,42 @@ func TestAuthorizeRejectsDisallowedRedirectURI(t *testing.T) {
 	}
 }
 
+func TestAuthorizeAllowsLoopbackRedirectWithEphemeralPort(t *testing.T) {
+	app := newDemoOAuthTestApp(t)
+
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", "desktop-client")
+	values.Set("redirect_uri", "http://localhost:49152/callback")
+	values.Set("response_mode", "json")
+	values.Set("code_challenge", "verifier-123")
+	values.Set("code_challenge_method", "plain")
+	values.Set("demo_email", "alice@example.com")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusOK)
+	if code, _ := resp["code"].(string); code == "" {
+		t.Fatalf("expected authorization code in response")
+	}
+}
+
+func TestAuthorizeRejectsLoopbackRedirectWrongPath(t *testing.T) {
+	app := newDemoOAuthTestApp(t)
+
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", "desktop-client")
+	values.Set("redirect_uri", "http://localhost:49152/not-callback")
+	values.Set("response_mode", "json")
+	values.Set("code_challenge", "verifier-123")
+	values.Set("code_challenge_method", "plain")
+	values.Set("demo_email", "alice@example.com")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusBadRequest)
+	if resp["error"] != "redirect_uri not allowed" {
+		t.Fatalf("expected redirect_uri validation error, got %v", resp["error"])
+	}
+}
+
 func TestVerifyPKCE(t *testing.T) {
 	s256Verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 	sum := sha256.Sum256([]byte(s256Verifier))

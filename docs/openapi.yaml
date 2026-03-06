@@ -27,12 +27,14 @@ components:
     DeviceIdentity:
       type: object
       properties:
-        deviceId:
+        algorithm:
           type: string
-        ownerUid:
+          enum: [ed25519]
+        public_key:
           type: string
-        identityKey:
+        updated_at:
           type: string
+          format: date-time
     IntegrationRoute:
       type: object
       properties:
@@ -128,26 +130,29 @@ paths:
           required: true
           schema: { type: string }
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [public_key]
               properties:
-                identityKey:
+                algorithm:
+                  type: string
+                  enum: [ed25519]
+                  default: ed25519
+                public_key:
+                  type: string
+                display_name:
                   type: string
       responses:
-        '200':
+        '204':
           description: Device identity updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceIdentity'
         '403':
           description: Insufficient scope
     get:
       summary: Fetch device identity key
-      description: Requires `gateway:session` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: device_id
@@ -164,7 +169,7 @@ paths:
   /gateway/v1/shares/invites:
     post:
       summary: Create share invite
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       requestBody:
         required: true
         content:
@@ -181,7 +186,7 @@ paths:
   /gateway/v1/shares/invites/accept:
     post:
       summary: Accept share invite
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       requestBody:
         required: true
         content:
@@ -198,7 +203,7 @@ paths:
   /gateway/v1/shares/devices/{device_id}/grants:
     get:
       summary: List grants for a device
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: device_id
@@ -210,7 +215,7 @@ paths:
   /gateway/v1/shares/grants/{grant_id}/revoke:
     post:
       summary: Revoke share grant
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: grant_id
@@ -222,7 +227,7 @@ paths:
   /gateway/v1/shares/grants/{grant_id}/leave:
     post:
       summary: Leave share grant
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: grant_id
@@ -236,7 +241,7 @@ paths:
     post:
       summary: Initialize a relay session handshake
       description: |
-        Requires `gateway:session` scope.
+        Requires authenticated user token.
         Creates or reuses a secure handshake and forwards `session.handshake.request` to the connected agent.
       parameters:
         - in: path
@@ -262,7 +267,7 @@ paths:
   /gateway/v1/sessions/{session_id}/handshake/{handshake_id}:
     get:
       summary: Retrieve handshake state
-      description: Requires `gateway:session` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: session_id
@@ -306,7 +311,7 @@ paths:
     post:
       summary: Send session message
       description: |
-        Requires `gateway:session` scope.
+        Requires authenticated user token.
         Requires `X-Idempotency-Key`.
         Enforces encrypted envelope and monotonic `seq` replay protection by default.
       parameters:
@@ -341,7 +346,7 @@ paths:
   /gateway/v1/sessions/{session_id}/events:
     get:
       summary: Stream session events (SSE)
-      description: Requires `gateway:session` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: session_id
@@ -378,7 +383,7 @@ paths:
   /gateway/v1/integrations/routes:
     post:
       summary: Create integration route
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       requestBody:
         required: true
         content:
@@ -411,7 +416,7 @@ paths:
                     type: string
     get:
       summary: List integration routes
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       responses:
         '200':
           description: Route list
@@ -419,7 +424,7 @@ paths:
   /gateway/v1/integrations/routes/{route_id}:
     put:
       summary: Update integration route
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: route_id
@@ -430,7 +435,7 @@ paths:
           description: Updated
     delete:
       summary: Revoke integration route
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: route_id
@@ -443,7 +448,7 @@ paths:
   /gateway/v1/integrations/routes/{route_id}/rotate-token:
     post:
       summary: Rotate route token
-      description: Requires `gateway:share` scope.
+      description: Requires authenticated user token.
       parameters:
         - in: path
           name: route_id

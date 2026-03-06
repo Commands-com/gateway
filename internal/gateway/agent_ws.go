@@ -244,6 +244,9 @@ func (h *Handler) handleAgentFrame(deviceID string, payload []byte, connState *a
 			"at":        time.Now().UTC().Format(time.RFC3339),
 		})
 		return
+	case "agent.hello":
+		// Compatibility: allow unauthenticated hello before transport.init arrives.
+		return
 	}
 
 	if violation := h.validateAndAdvanceTransportFrame(deviceID, connState, frame); violation != "" {

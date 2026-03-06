@@ -14,6 +14,103 @@ import (
 	"oss-commands-gateway/internal/config"
 )
 
+func identityPayload(publicKey string) map[string]any {
+	return map[string]any{
+		"algorithm":  "ed25519",
+		"public_key": publicKey,
+	}
+}
+
+func TestPutDeviceIdentityKeyAcceptsLegacyPayloadAliases(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayTestApp(h)
+
+	identityKey, _ := testEd25519Identity("owner-legacy")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devlegacy1/identity-key", map[string]any{
+		"identityKey": identityKey,
+	}, "owner1", "owner@example.com", fiber.StatusNoContent)
+
+	got := mustDoJSON(t, app, "GET", "/gateway/v1/devices/devlegacy1/identity-key", nil, "owner1", "owner@example.com", fiber.StatusOK)
+	if got["public_key"] != identityKey {
+		t.Fatalf("expected legacy identityKey to persist as public_key, got %v", got["public_key"])
+	}
+
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devlegacy1/identity-key", map[string]any{
+		"identity_key": identityKey,
+	}, "owner1", "owner@example.com", fiber.StatusNoContent)
+}
+
+func TestListDevicesAllowsOwnerByEmailFallback(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+		AuthMode:      config.AuthModeDemo,
+	})
+	app := newGatewayTestApp(h)
+
+	identityKey, _ := testEd25519Identity("owner-email")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devmail1/identity-key", identityPayload(identityKey), "owner-uid-a", "dtannen@example.com", fiber.StatusNoContent)
+
+	// Different UID, same canonical email should still be treated as owner.
+	if !h.canAccessDeviceForPrincipal("owner-uid-b", "dtannen@example.com", "devmail1") {
+		t.Fatalf("expected email fallback owner access to device")
+	}
+}
+
+func TestOwnerEmailFallbackDisabledOutsideDemo(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+		AuthMode:      config.AuthModeOIDC,
+	})
+	app := newGatewayTestApp(h)
+
+	identityKey, _ := testEd25519Identity("owner-nondemo")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devnondemo1/identity-key", identityPayload(identityKey), "owner-uid-a", "same@example.com", fiber.StatusNoContent)
+
+	if h.canAccessDeviceForPrincipal("owner-uid-b", "same@example.com", "devnondemo1") {
+		t.Fatalf("expected email fallback to be disabled in non-demo auth mode")
+	}
+}
+
+func TestListDevicesReturnsStoredDisplayName(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayTestApp(h)
+
+	identityKey, _ := testEd25519Identity("owner-display")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devdisplay1/identity-key", map[string]any{
+		"algorithm":    "ed25519",
+		"public_key":   identityKey,
+		"display_name": "Office Mac",
+	}, "owner1", "owner@example.com", fiber.StatusNoContent)
+
+	resp := mustDoJSON(t, app, "GET", "/gateway/v1/devices", nil, "owner1", "owner@example.com", fiber.StatusOK)
+	devices, ok := resp["devices"].([]any)
+	if !ok || len(devices) != 1 {
+		t.Fatalf("expected one device in list response, got %v", resp["devices"])
+	}
+	dev, ok := devices[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first device to be object")
+	}
+	if dev["display_name"] != "Office Mac" {
+		t.Fatalf("expected display_name Office Mac, got %v", dev["display_name"])
+	}
+	if dev["name"] != "Office Mac" {
+		t.Fatalf("expected name Office Mac, got %v", dev["name"])
+	}
+}
+
 func TestShareInviteAcceptAndList(t *testing.T) {
 	h := NewHandler(&config.Config{
 		FrontendURL:   "https://frontend.example",
@@ -24,7 +121,7 @@ func TestShareInviteAcceptAndList(t *testing.T) {
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
 	collabIdentityKey, _ := testEd25519Identity("collab1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 
 	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
 		"deviceId": "devowner1",
@@ -41,7 +138,7 @@ func TestShareInviteAcceptAndList(t *testing.T) {
 		t.Fatalf("expected invite token in inviteUrl")
 	}
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", identityPayload(collabIdentityKey), "collab1", "collab@example.com", fiber.StatusNoContent)
 
 	acceptResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
 		"token":    token,
@@ -82,7 +179,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
 	collabIdentityKey, _ := testEd25519Identity("collab1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 
 	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
 		"deviceId": "devowner1",
@@ -99,7 +196,7 @@ func TestShareGrantIndexMaintainedOnRevoke(t *testing.T) {
 		t.Fatalf("expected invite token in inviteUrl")
 	}
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", identityPayload(collabIdentityKey), "collab1", "collab@example.com", fiber.StatusNoContent)
 	mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
 		"token":    token,
 		"deviceId": "devcollab1",
@@ -160,7 +257,7 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 
 	ownerIdentityKey, ownerIdentityPriv := testEd25519Identity("owner1")
 	collabIdentityKey, _ := testEd25519Identity("collab1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 
 	inviteResp := mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites", map[string]any{
 		"deviceId": "devowner1",
@@ -169,7 +266,7 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 	inviteURL, _ := inviteResp["inviteUrl"].(string)
 	token := inviteURL[strings.LastIndex(inviteURL, "/")+1:]
 
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", map[string]any{"identityKey": collabIdentityKey}, "collab1", "collab@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devcollab1/identity-key", identityPayload(collabIdentityKey), "collab1", "collab@example.com", fiber.StatusNoContent)
 	mustDoJSON(t, app, "POST", "/gateway/v1/shares/invites/accept", map[string]any{
 		"token":    token,
 		"deviceId": "devcollab1",
@@ -215,11 +312,8 @@ func TestSessionMessageCreatesEventAndEnforcesMembership(t *testing.T) {
 	}
 
 	events := h.replayEvents("sessabc1", "")
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events (handshake ack + message), got %d", len(events))
-	}
-	if !strings.Contains(string(events[1].Data), "msg-1") {
-		t.Fatalf("expected latest event payload to contain message_id msg-1")
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event (handshake ack), got %d", len(events))
 	}
 
 	mustDoJSONWithHeaders(t, app, "POST", "/gateway/v1/sessions/sessabc1/messages", map[string]any{
@@ -247,6 +341,7 @@ func newGatewayTestApp(h *Handler) *fiber.App {
 	})
 
 	group := app.Group("/gateway/v1")
+	group.Get("/devices", h.ListDevices)
 	group.Put("/devices/:device_id/identity-key", h.PutDeviceIdentityKey)
 	group.Get("/devices/:device_id/identity-key", h.GetDeviceIdentityKey)
 	group.Post("/shares/invites", h.CreateShareInvite)

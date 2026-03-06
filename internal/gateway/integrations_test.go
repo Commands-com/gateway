@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +25,7 @@ func TestIngressRelaysThroughActiveTunnel(t *testing.T) {
 	app := newGatewayIntegrationTestApp(h)
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -112,7 +113,7 @@ func TestIngressRejectsTokenMismatch(t *testing.T) {
 	app := newGatewayIntegrationTestApp(h)
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -157,7 +158,7 @@ func TestIngressRejectsWhenLeaseOwnedByRemoteNode(t *testing.T) {
 	app := newGatewayIntegrationTestApp(h)
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -233,7 +234,7 @@ func TestTunnelLeaseRenewalDropsLostRoute(t *testing.T) {
 	app := newGatewayIntegrationTestApp(h)
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",
@@ -296,6 +297,68 @@ func TestTunnelLeaseRenewalDropsLostRoute(t *testing.T) {
 	}
 }
 
+func TestSetTunnelRouteStatusGuardsTerminalAndDeviceMismatch(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	routeID := "rt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	route := &integrationRoute{
+		RouteID:          routeID,
+		OwnerUID:         "owner1",
+		DeviceID:         "devowner1",
+		InterfaceType:    "http",
+		TokenAuthMode:    "path",
+		Status:           "active",
+		DeadlineMs:       2500,
+		MaxBodyBytes:     1024,
+		TokenMaxAgeDays:  90,
+		TokenExpiresAt:   now,
+		TokenCurrentHash: "hash",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		t.Fatalf("save route failed: %v", err)
+	}
+
+	if err := h.setTunnelRouteStatus(routeID, "different-device", "inactive", now, false); err != nil {
+		t.Fatalf("unexpected error for mismatched-device transition: %v", err)
+	}
+	stored, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || stored == nil {
+		t.Fatalf("expected stored route, found=%v err=%v", found, err)
+	}
+	if stored.Status != "active" {
+		t.Fatalf("expected mismatched-device transition to be ignored, got status=%s", stored.Status)
+	}
+
+	stored.Status = "revoked"
+	stored.UpdatedAt = now
+	if err := h.store.SaveIntegrationRoute(context.Background(), stored); err != nil {
+		t.Fatalf("save revoked route failed: %v", err)
+	}
+
+	if err := h.setTunnelRouteStatus(routeID, "devowner1", "provisioned", now, false); err != nil {
+		t.Fatalf("unexpected error for revoked transition: %v", err)
+	}
+	stored, found, err = h.store.GetIntegrationRoute(context.Background(), routeID)
+	if err != nil || !found || stored == nil {
+		t.Fatalf("expected stored route after revoked transition, found=%v err=%v", found, err)
+	}
+	if stored.Status != "revoked" {
+		t.Fatalf("expected revoked status to be preserved, got %s", stored.Status)
+	}
+
+	err = h.setTunnelRouteStatus(routeID, "devowner1", "active", now, true)
+	if !errors.Is(err, errRouteStatusUpdateSkipped) {
+		t.Fatalf("expected strict transition to fail for revoked route, got %v", err)
+	}
+}
+
 func TestWebSocketUpgradeMiddlewareForAgentAndTunnel(t *testing.T) {
 	h := NewHandler(&config.Config{
 		FrontendURL:   "https://frontend.example",
@@ -305,7 +368,7 @@ func TestWebSocketUpgradeMiddlewareForAgentAndTunnel(t *testing.T) {
 	app := newGatewayIntegrationTestApp(h)
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 
 	reqForbidden := httptest.NewRequest("GET", "/gateway/v1/agent/connect?device_id=devowner1", nil)
 	reqForbidden.Header.Set("X-Test-UID", "other-user")

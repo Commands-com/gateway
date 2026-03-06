@@ -40,7 +40,7 @@ func TestAgentWebSocketReconnectE2E(t *testing.T) {
 
 	client := &http.Client{Timeout: 3 * time.Second}
 
-	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/sessions/"+sessionID+"/handshake/client-init", map[string]any{
 		"device_id":                   "devowner1",
 		"client_ephemeral_public_key": clientEphemeral,
@@ -133,7 +133,7 @@ func TestTunnelIngressReconnectE2E(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	ownerIdentityKey, _ := testEd25519Identity("owner1")
-	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", map[string]any{"identityKey": ownerIdentityKey}, "owner1", "owner@example.com", fiber.StatusOK)
+	mustHTTPJSON(t, client, fiber.MethodPut, httpBase+"/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
 	createResp := mustHTTPJSON(t, client, fiber.MethodPost, httpBase+"/gateway/v1/integrations/routes", map[string]any{
 		"device_id":       "devowner1",
 		"interface_type":  "slack_events",

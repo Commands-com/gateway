@@ -44,6 +44,7 @@ type Handler struct {
 
 type deviceRecord struct {
 	DeviceID    string
+	DisplayName string
 	OwnerUID    string
 	OwnerEmail  string
 	IdentityKey string
@@ -98,7 +99,11 @@ type sessionEvent struct {
 }
 
 type putDeviceIdentityKeyRequest struct {
-	IdentityKey string `json:"identityKey"`
+	Algorithm       string `json:"algorithm"`
+	PublicKey       string `json:"public_key"`
+	LegacyPublicKey string `json:"identityKey"`
+	SnakePublicKey  string `json:"identity_key"`
+	DisplayName     string `json:"display_name"`
 }
 
 type createShareInviteRequest struct {

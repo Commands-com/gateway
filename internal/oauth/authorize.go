@@ -166,15 +166,63 @@ func (h *Handler) isRedirectAllowed(candidate string) bool {
 	if candidate == "" {
 		return false
 	}
+	candidateURL, err := url.Parse(candidate)
+	if err != nil {
+		return false
+	}
+	if candidateURL.User != nil {
+		return false
+	}
 	if len(h.cfg.RedirectAllowlist) == 0 {
 		return true
 	}
 	for _, allowed := range h.cfg.RedirectAllowlist {
-		if strings.TrimSpace(allowed) == candidate {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == candidate {
+			return true
+		}
+		if loopbackRedirectPortMatch(candidateURL, allowed) {
 			return true
 		}
 	}
 	return false
+}
+
+func loopbackRedirectPortMatch(candidate *url.URL, allowedRaw string) bool {
+	if candidate == nil || !isLoopbackHTTPRedirect(candidate) {
+		return false
+	}
+	if candidate.Port() == "" {
+		return false
+	}
+
+	allowedURL, err := url.Parse(strings.TrimSpace(allowedRaw))
+	if err != nil {
+		return false
+	}
+	if allowedURL.User != nil || !isLoopbackHTTPRedirect(allowedURL) {
+		return false
+	}
+
+	// For native-app loopback callbacks, allow ephemeral ports but pin path/query.
+	if candidate.Path != allowedURL.Path {
+		return false
+	}
+	if candidate.RawQuery != allowedURL.RawQuery {
+		return false
+	}
+	return true
+}
+
+func isLoopbackHTTPRedirect(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func normalizeScope(scope string) string {

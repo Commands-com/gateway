@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -395,7 +396,16 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		return nil
 	})
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		switch {
+		case errors.Is(err, ErrRouteNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
+		case errors.Is(err, ErrRouteVersionConflict):
+			return c.Status(fiber.StatusConflict).JSON(integrationErrorResponse("version_conflict", "Route was modified concurrently; please retry", nil))
+		case err.Error() == "forbidden":
+			return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
+		default:
+			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		}
 	}
 
 	if deactivatedTunnel != nil {
@@ -566,7 +576,16 @@ func (h *Handler) RotateIntegrationRouteToken(c fiber.Ctx) error {
 		return nil
 	})
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		switch {
+		case errors.Is(err, ErrRouteNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(integrationErrorResponse("route_not_found", "Route not found", nil))
+		case errors.Is(err, ErrRouteVersionConflict):
+			return c.Status(fiber.StatusConflict).JSON(integrationErrorResponse("version_conflict", "Route was modified concurrently; please retry", nil))
+		case err.Error() == "forbidden":
+			return c.Status(fiber.StatusForbidden).JSON(integrationErrorResponse("forbidden", "You do not own this route", nil))
+		default:
+			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		}
 	}
 
 	resp := fiber.Map{

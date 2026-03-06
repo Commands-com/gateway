@@ -73,7 +73,7 @@ func (h *Handler) PostHandshakeClientInit(c fiber.Ctx) error {
 	if !exists {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
 	}
-	if !h.canAccessDevice(principal.UID, deviceID) {
+	if !h.canAccessDeviceForPrincipal(principal.UID, principal.Email, deviceID) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 
@@ -586,12 +586,6 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		})
 	}
 
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to encode event"})
-	}
-	eventID := h.appendSessionEvent(sessionID, raw)
-
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 		"status":          "forwarded_to_agent",
 		"session_id":      sessionID,
@@ -602,8 +596,6 @@ func (h *Handler) PostSessionMessage(c fiber.Ctx) error {
 		"conversationId":  conversationID,
 		"message_id":      messageID,
 		"messageId":       messageID,
-		"event_id":        eventID,
-		"eventId":         eventID,
 	})
 }
 

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -30,6 +31,7 @@ const (
 )
 
 var wsConnIDCounter uint64
+var errRouteStatusUpdateSkipped = errors.New("route_status_update_skipped")
 
 type tunnelConn struct {
 	deviceID        string
@@ -637,9 +639,7 @@ func (h *Handler) handleTunnelActivate(tc *tunnelConn, frame map[string]any) {
 				}
 				break
 			}
-			route.Status = "active"
-			route.UpdatedAt = now
-			if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+			if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "active", now, true); err != nil {
 				if active {
 					_ = h.store.SetActiveRouteDevice(context.Background(), routeID, existingDeviceID)
 					if supersededTunnel != nil {
@@ -755,32 +755,16 @@ func (h *Handler) handleTunnelDeactivate(tc *tunnelConn, frame map[string]any) {
 				})
 				continue
 			}
-			route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
-			if err != nil {
+			if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "inactive", now, false); err != nil {
 				results = append(results, map[string]any{
 					"route_id": routeID,
 					"status":   "rejected",
 					"error": map[string]string{
 						"code":    "internal_error",
-						"message": "Failed to load route state",
+						"message": "Failed to persist route state",
 					},
 				})
 				continue
-			}
-			if found && route != nil {
-				route.Status = "inactive"
-				route.UpdatedAt = now
-				if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
-					results = append(results, map[string]any{
-						"route_id": routeID,
-						"status":   "rejected",
-						"error": map[string]string{
-							"code":    "internal_error",
-							"message": "Failed to persist route state",
-						},
-					})
-					continue
-				}
 			}
 			results = append(results, map[string]any{"route_id": routeID, "status": "inactive"})
 			continue
@@ -919,13 +903,7 @@ func (h *Handler) deactivateAllTunnelRoutes(tc *tunnelConn, reason string) {
 			log.Printf("[tunnel] failed to release lease route=%s: %v", routeID, err)
 		}
 		routesToDeactivate = append(routesToDeactivate, routeID)
-		route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
-		if err != nil || !found || route == nil || route.Status == "revoked" {
-			continue
-		}
-		route.Status = "provisioned"
-		route.UpdatedAt = now
-		if err := h.store.SaveIntegrationRoute(context.Background(), route); err != nil {
+		if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "provisioned", now, false); err != nil {
 			log.Printf("[tunnel] failed to persist deactivation route=%s: %v", routeID, err)
 		}
 	}
@@ -1164,11 +1142,8 @@ func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
 	if err == nil && active && activeDeviceID == tc.deviceID {
 		_ = h.store.DeleteActiveRoute(context.Background(), routeID)
 	}
-	route, found, err := h.store.GetIntegrationRoute(context.Background(), routeID)
-	if err == nil && found && route != nil && route.Status != "revoked" {
-		route.Status = "inactive"
-		route.UpdatedAt = now
-		_ = h.store.SaveIntegrationRoute(context.Background(), route)
+	if err := h.setTunnelRouteStatus(routeID, tc.deviceID, "inactive", now, false); err != nil {
+		log.Printf("[tunnel] failed to persist lost-lease route=%s: %v", routeID, err)
 	}
 
 	if tc.conn != nil {
@@ -1179,6 +1154,33 @@ func (h *Handler) handleLostTunnelLease(tc *tunnelConn, routeID string) {
 			"at":       now,
 		})
 	}
+}
+
+func (h *Handler) setTunnelRouteStatus(routeID, expectedDeviceID, nextStatus, updatedAt string, strict bool) error {
+	_, err := h.store.UpdateIntegrationRoute(context.Background(), routeID, func(route *integrationRoute) error {
+		if route == nil {
+			return ErrRouteNotFound
+		}
+		if expectedDeviceID != "" && route.DeviceID != expectedDeviceID {
+			return errRouteStatusUpdateSkipped
+		}
+		if route.Status == "revoked" {
+			return errRouteStatusUpdateSkipped
+		}
+		route.Status = nextStatus
+		route.UpdatedAt = updatedAt
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	if strict {
+		return err
+	}
+	if errors.Is(err, ErrRouteNotFound) || errors.Is(err, errRouteStatusUpdateSkipped) {
+		return nil
+	}
+	return err
 }
 
 func (h *Handler) startInflightSweeper() {

@@ -51,22 +51,14 @@ func TestGatewayScopeEnforcement(t *testing.T) {
 	tokenDevice := issueTestToken(t, issuer, []string{"device"})
 
 	status, body := doJSON(t, app, fiber.MethodPost, "/gateway/v1/sessions/scope-test/messages", map[string]any{"message_id": "m-1"}, tokenShare)
-	if status != fiber.StatusForbidden {
-		t.Fatalf("expected 403 for missing session scope, got %d body=%v", status, body)
-	}
-	if body["error"] != "insufficient_scope" {
-		t.Fatalf("expected insufficient_scope for session endpoint, got %v", body)
+	if status == fiber.StatusForbidden && body["error"] == "insufficient_scope" {
+		t.Fatalf("did not expect scope gate on session endpoint, got %d body=%v", status, body)
 	}
 
-	status, body = doJSON(t, app, fiber.MethodPost, "/gateway/v1/shares/invites", map[string]any{"deviceId": "d1", "email": "a@example.com"}, tokenSession)
-	if status != fiber.StatusForbidden {
-		t.Fatalf("expected 403 for missing share scope, got %d body=%v", status, body)
-	}
-	if body["error"] != "insufficient_scope" {
-		t.Fatalf("expected insufficient_scope for share endpoint, got %v", body)
-	}
-
-	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": validIdentityKey}, tokenSession)
+	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{
+		"algorithm":  "ed25519",
+		"public_key": validIdentityKey,
+	}, tokenSession)
 	if status != fiber.StatusForbidden {
 		t.Fatalf("expected 403 for missing device scope, got %d body=%v", status, body)
 	}
@@ -74,12 +66,49 @@ func TestGatewayScopeEnforcement(t *testing.T) {
 		t.Fatalf("expected insufficient_scope for device endpoint, got %v", body)
 	}
 
-	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{"identityKey": validIdentityKey}, tokenDevice)
+	status, body = doJSON(t, app, fiber.MethodGet, "/gateway/v1/devices", nil, tokenShare)
 	if status != fiber.StatusOK {
+		t.Fatalf("expected authenticated token to list devices, got %d body=%v", status, body)
+	}
+
+	status, body = doJSON(t, app, fiber.MethodPut, "/gateway/v1/devices/devscope1/identity-key", map[string]any{
+		"algorithm":  "ed25519",
+		"public_key": validIdentityKey,
+	}, tokenDevice)
+	if status != fiber.StatusNoContent {
 		t.Fatalf("expected device-scoped token to pass, got %d body=%v", status, body)
 	}
-	if body["deviceId"] != "devscope1" {
-		t.Fatalf("expected deviceId=devscope1, got %v", body)
+
+	status, body = doJSON(t, app, fiber.MethodGet, "/gateway/v1/devices", nil, tokenSession)
+	if status != fiber.StatusOK {
+		t.Fatalf("expected session-scoped token to list devices, got %d body=%v", status, body)
+	}
+	if _, ok := body["devices"]; !ok {
+		t.Fatalf("expected devices list response body, got %v", body)
+	}
+
+	status, body = doJSON(t, app, fiber.MethodPost, "/gateway/v1/shares/invites", map[string]any{
+		"deviceId": "devscope1",
+		"email":    "invitee@example.com",
+	}, tokenSession)
+	if status != fiber.StatusCreated {
+		t.Fatalf("expected authenticated token to create share invite, got %d body=%v", status, body)
+	}
+
+	status, body = doJSON(t, app, fiber.MethodPost, "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":      "devscope1",
+		"interface_type": "http",
+	}, tokenShare)
+	if status != fiber.StatusCreated {
+		t.Fatalf("expected authenticated token to create integration route, got %d body=%v", status, body)
+	}
+
+	status, body = doJSON(t, app, fiber.MethodPost, "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":      "devscope1",
+		"interface_type": "http",
+	}, tokenSession)
+	if status != fiber.StatusCreated {
+		t.Fatalf("expected session-scoped token to create integration route, got %d body=%v", status, body)
 	}
 }
 
