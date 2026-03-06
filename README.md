@@ -34,12 +34,16 @@ Modular OSS gateway for OAuth, device sharing, relay, and webhook tunneling.
 cp .env.example .env
 ```
 
-2. Set at minimum:
+2. Generate a signing key and set env vars:
+
+```bash
+# Generate a strong random key
+openssl rand -base64 48
+```
 
 ```bash
 PORT=8080
-PUBLIC_BASE_URL=http://localhost:8080
-JWT_SIGNING_KEY=replace-with-strong-random-secret-at-least-32-bytes
+JWT_SIGNING_KEY=<paste-generated-key-here>
 AUTH_MODE=demo
 STATE_BACKEND=memory
 ```
@@ -78,16 +82,21 @@ REDIRECT_ALLOWLIST=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
 OAUTH_REDIRECT_URIS=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
 ```
 
+## Built-in Console
+
+The gateway includes a built-in admin console at `/console` with device management,
+session chat, and dashboard. It authenticates through the same OAuth flow as all other clients.
+
 ## Deploy to Railway (10-Minute Path)
 
 1. Create a Railway project from this repo.
 2. Add env vars:
-   - `JWT_SIGNING_KEY`
-   - `AUTH_MODE=demo`
+   - `JWT_SIGNING_KEY` — generate with `openssl rand -base64 48`
+   - `AUTH_MODE=demo` (or `oidc` for Firebase — see below)
    - `STATE_BACKEND=memory`
-   - `PUBLIC_BASE_URL` (or rely on `RAILWAY_PUBLIC_DOMAIN` auto-detection)
+   - `PUBLIC_BASE_URL` is auto-detected from `RAILWAY_PUBLIC_DOMAIN`; only set it if using a custom domain
 3. Deploy.
-4. Copy your public URL and set it as `Gateway URL` in desktop settings.
+4. Visit `https://<your-domain>/console` or set the URL as `Gateway URL` in desktop settings.
 
 ## Auth Modes
 
@@ -96,12 +105,26 @@ OAUTH_REDIRECT_URIS=http://localhost:61696/callback,urn:ietf:wg:oauth:2.0:oob
   - Non-production mode.
   - OAuth still issues signed gateway tokens.
 - `AUTH_MODE=firebase`
-  - Verifies Firebase ID tokens.
+  - Verifies Firebase ID tokens server-side using the Firebase Admin SDK.
   - Requires `FIREBASE_PROJECT_ID`.
   - Optional: `FIREBASE_CREDENTIALS_PATH`.
 - `AUTH_MODE=oidc`
-  - Verifies generic OIDC ID tokens.
+  - Verifies generic OIDC ID tokens via the issuer's public JWKS.
   - Requires `OIDC_ISSUER_URL` and `OIDC_CLIENT_ID`.
+  - Works with Firebase — set `OIDC_ISSUER_URL=https://securetoken.google.com/<project-id>` and `OIDC_CLIENT_ID=<project-id>`. No credentials file needed.
+
+### Firebase Sign-In UI
+
+When `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` are set, the OAuth authorize page
+shows Google and GitHub sign-in buttons powered by Firebase Authentication (popup flow).
+This works with both `AUTH_MODE=firebase` and `AUTH_MODE=oidc`.
+
+Required env vars:
+- `FIREBASE_API_KEY` — your Firebase project's web API key (public, safe to expose)
+- `FIREBASE_PROJECT_ID` — your Firebase project ID
+
+You must also add your deployment domain (e.g. `gateway-xyz.up.railway.app`) to
+**Firebase Console → Authentication → Settings → Authorized domains**.
 
 ## Scope Policy
 
