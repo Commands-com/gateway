@@ -101,7 +101,7 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"grantId":              grantID,
 		"status":               "pending",
-		"inviteUrl":            inviteURL(h.cfg.FrontendURL, token),
+		"inviteUrl":            inviteURL(h.cfg.PublicBaseURL, token),
 		"inviteTokenExpiresAt": inviteExpiresAt,
 		"grantExpiresAt":       req.GrantExpiresAt,
 	})
