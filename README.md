@@ -71,7 +71,7 @@ Open the console at [http://localhost:8080/console](http://localhost:8080/consol
 
 ### Desktop Agent Compatibility
 
-For use with the [Commands.com Agent](https://github.com/Commands-com/commands-com-agent-hub):
+For use with the [Commands.com Agent Workspace](https://github.com/Commands-com/agent-workspace):
 
 ```bash
 export JWT_SIGNING_KEY="$(openssl rand -hex 32)"
