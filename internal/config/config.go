@@ -91,8 +91,8 @@ func Load() (*Config, error) {
 		AuthMode:         AuthMode(strings.ToLower(envOrDefault("AUTH_MODE", "demo"))),
 		DemoAuthDisabled: envBool("DEMO_AUTH_DISABLED", false),
 
-		OAuthDefaultClientID: envOrDefault("OAUTH_DEFAULT_CLIENT_ID", "oss-gateway-public-client"),
-		OAuthClientName:      envOrDefault("OAUTH_CLIENT_NAME", "OSS Gateway"),
+		OAuthDefaultClientID: envOrDefault("OAUTH_DEFAULT_CLIENT_ID", "commands-agent"),
+		OAuthClientName:      envOrDefault("OAUTH_CLIENT_NAME", "Commands.com Gateway"),
 		OAuthRedirectURIs:    csvOrDefault("OAUTH_REDIRECT_URIS", nil),
 
 		ProxyHeader: strings.TrimSpace(os.Getenv("PROXY_HEADER")),

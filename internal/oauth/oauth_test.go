@@ -30,7 +30,7 @@ func TestAuthorizationCodeAndRefreshFlow(t *testing.T) {
 
 	authorizeValues := url.Values{}
 	authorizeValues.Set("response_type", "code")
-	authorizeValues.Set("client_id", "oss-gateway-public-client")
+	authorizeValues.Set("client_id", "commands-agent")
 	authorizeValues.Set("redirect_uri", "http://localhost:61696/callback")
 	authorizeValues.Set("scope", "profile email")
 	authorizeValues.Set("state", "st-123")
@@ -48,7 +48,7 @@ func TestAuthorizationCodeAndRefreshFlow(t *testing.T) {
 
 	tokenValues := url.Values{}
 	tokenValues.Set("grant_type", "authorization_code")
-	tokenValues.Set("client_id", "oss-gateway-public-client")
+	tokenValues.Set("client_id", "commands-agent")
 	tokenValues.Set("code", code)
 	tokenValues.Set("redirect_uri", "http://localhost:61696/callback")
 	tokenValues.Set("code_verifier", verifier)
@@ -90,7 +90,7 @@ func TestAuthorizeRejectsDisallowedRedirectURI(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "oss-gateway-public-client")
+	values.Set("client_id", "commands-agent")
 	values.Set("redirect_uri", "http://not-allowed/callback")
 	values.Set("response_mode", "json")
 	values.Set("demo_email", "alice@example.com")
@@ -107,7 +107,7 @@ func TestAuthorizeAllowsLoopbackRedirectWithEphemeralPort(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "oss-gateway-public-client")
+	values.Set("client_id", "commands-agent")
 	values.Set("redirect_uri", "http://localhost:49152/callback")
 	values.Set("response_mode", "json")
 	values.Set("code_challenge", challenge)
@@ -125,7 +125,7 @@ func TestAuthorizeRejectsLoopbackRedirectWrongPath(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "oss-gateway-public-client")
+	values.Set("client_id", "commands-agent")
 	values.Set("redirect_uri", "http://localhost:49152/not-callback")
 	values.Set("response_mode", "json")
 	values.Set("code_challenge", "verifier-123")
@@ -144,7 +144,7 @@ func TestUnknownScopeIsRejected(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "oss-gateway-public-client")
+	values.Set("client_id", "commands-agent")
 	values.Set("redirect_uri", "http://localhost:61696/callback")
 	values.Set("scope", "profile device")
 	values.Set("code_challenge", challenge)
@@ -220,7 +220,7 @@ func TestDemoEmailUIDStabilityAcrossFlows(t *testing.T) {
 	authorize := func(email string) string {
 		values := url.Values{}
 		values.Set("response_type", "code")
-		values.Set("client_id", "oss-gateway-public-client")
+		values.Set("client_id", "commands-agent")
 		values.Set("redirect_uri", "http://localhost:61696/callback")
 		values.Set("scope", "profile")
 		values.Set("code_challenge", challenge)
@@ -236,7 +236,7 @@ func TestDemoEmailUIDStabilityAcrossFlows(t *testing.T) {
 
 		tokenValues := url.Values{}
 		tokenValues.Set("grant_type", "authorization_code")
-		tokenValues.Set("client_id", "oss-gateway-public-client")
+		tokenValues.Set("client_id", "commands-agent")
 		tokenValues.Set("code", code)
 		tokenValues.Set("redirect_uri", "http://localhost:61696/callback")
 		tokenValues.Set("code_verifier", verifier)
@@ -319,7 +319,7 @@ func newDemoOAuthTestApp(t *testing.T) *fiber.App {
 		RefreshTokenTTL:      24 * time.Hour,
 		Audience:             "commands-gateway-test",
 		JWTSigningKey:        "test-signing-secret-at-least-32-bytes-long",
-		OAuthDefaultClientID: "oss-gateway-public-client",
+		OAuthDefaultClientID: "commands-agent",
 	}
 	jm, err := jwt.NewManager(cfg.JWTSigningKey, cfg.PublicBaseURL, cfg.Audience)
 	if err != nil {
