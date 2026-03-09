@@ -19,6 +19,8 @@ import (
 
 const maxAgentConnectionsPerOwner = 50
 
+const wsWriteTimeout = 10 * time.Second
+
 type agentConn struct {
 	deviceID         string
 	ownerUID         string
@@ -39,12 +41,14 @@ func (ac *agentConn) writeJSON(payload map[string]any) error {
 	}
 	ac.sendMu.Lock()
 	defer ac.sendMu.Unlock()
+	_ = ac.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	return ac.conn.WriteMessage(websocket.TextMessage, raw)
 }
 
 func (ac *agentConn) closeWithMessage(code int, reason string) {
 	ac.sendMu.Lock()
 	defer ac.sendMu.Unlock()
+	_ = ac.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_ = ac.conn.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(code, reason),

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
@@ -28,6 +29,12 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 	if req.ClientID == "" {
 		req.ClientID = h.cfg.OAuthDefaultClientID
 	}
+	// Only the configured default public client is accepted. Without a
+	// real client registry, accepting arbitrary client_ids would let any
+	// caller mint tokens for made-up clients.
+	if req.ClientID != h.cfg.OAuthDefaultClientID {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_client", "error_description": "unknown client_id"})
+	}
 	if req.RedirectURI == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "redirect_uri is required"})
 	}
@@ -48,6 +55,9 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 	if codeChallenge == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": "code_challenge is required (PKCE)"})
 	}
+	if err := validatePKCECodeChallenge(codeChallenge); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": err.Error()})
+	}
 	challengeMethod, methodErr := normalizeChallengeMethod(req.CodeChallengeMethod)
 	if methodErr != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request", "error_description": methodErr.Error()})
@@ -58,17 +68,24 @@ func (h *Handler) Authorize(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate authorization code"})
 	}
 
-	h.store.putAuthCode(code, authorizationCodeRecord{
+	scope, scopeErr := normalizeScope(req.Scope)
+	if scopeErr != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_scope", "error_description": scopeErr.Error()})
+	}
+
+	if err := h.store.putAuthCode(code, authorizationCodeRecord{
 		ClientID:            req.ClientID,
 		RedirectURI:         req.RedirectURI,
-		Scope:               normalizeScope(req.Scope),
+		Scope:               scope,
 		State:               req.State,
 		Subject:             identity.UID,
 		Email:               identity.Email,
 		DisplayName:         identity.DisplayName,
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: challengeMethod,
-	}, h.cfg.AuthCodeTTL)
+	}, h.cfg.AuthCodeTTL); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "server_error", "error_description": "failed to persist authorization code"})
+	}
 
 	if strings.HasPrefix(req.RedirectURI, "urn:") || strings.EqualFold(req.ResponseMode, "json") || wantsJSON(c) {
 		return c.JSON(fiber.Map{
@@ -234,23 +251,73 @@ func isLoopbackHTTPRedirect(u *url.URL) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-func normalizeScope(scope string) string {
+// userAuthorizableScopes is the set of scopes that end-user OAuth clients may
+// request via the authorization endpoint. All authenticated users have full
+// access to device, session, and integration endpoints — no per-route scope
+// gates exist — so these scopes are informational only.
+var userAuthorizableScopes = map[string]bool{
+	"profile": true,
+	"email":   true,
+}
+
+// defaultScopes are granted when the client does not request any specific scopes.
+var defaultScopes = "profile email"
+
+func normalizeScope(scope string) (string, error) {
 	clean := strings.Fields(strings.TrimSpace(scope))
 	if len(clean) == 0 {
-		return "openid profile email device"
+		return defaultScopes, nil
 	}
-	return strings.Join(clean, " ")
+	filtered := make([]string, 0, len(clean))
+	var rejected []string
+	for _, s := range clean {
+		if s == "openid" {
+			// The server does not issue id_tokens so advertising
+			// OpenID scope would be misleading. Silently drop it.
+			continue
+		}
+		if !userAuthorizableScopes[s] {
+			rejected = append(rejected, s)
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	if len(rejected) > 0 {
+		return "", fmt.Errorf("unknown or unsupported scopes: %s", strings.Join(rejected, ", "))
+	}
+	if len(filtered) == 0 {
+		// The caller explicitly requested scopes but every one was
+		// unsupported. Returning the default set would silently grant
+		// broader access than requested (e.g. the `device` scope).
+		return "", fmt.Errorf("no supported scopes requested (\"openid\" is not supported)")
+	}
+	return strings.Join(filtered, " "), nil
 }
 
 func normalizeChallengeMethod(method string) (string, error) {
 	switch strings.ToUpper(strings.TrimSpace(method)) {
 	case "S256":
 		return "S256", nil
-	case "PLAIN", "":
-		return "plain", nil
+	case "PLAIN":
+		return "", fmt.Errorf("code_challenge_method 'plain' is not supported; use S256")
+	case "":
+		return "", fmt.Errorf("code_challenge_method is required; use S256")
 	default:
 		return "", fmt.Errorf("unsupported code_challenge_method: %s", method)
 	}
+}
+
+// pkceUnreservedRe matches the RFC 7636 unreserved character set:
+// [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"
+var pkceUnreservedRe = regexp.MustCompile(`^[A-Za-z0-9\-._~]+$`)
+
+// validatePKCECodeChallenge checks that code_challenge conforms to RFC 7636.
+// For S256 the challenge is a base64url-encoded SHA-256 hash (always 43 chars).
+func validatePKCECodeChallenge(challenge string) error {
+	if len(challenge) < 43 || len(challenge) > 128 {
+		return fmt.Errorf("code_challenge must be 43-128 characters (RFC 7636)")
+	}
+	return nil
 }
 
 func verifyPKCE(challenge, method, verifier string) error {
@@ -262,15 +329,19 @@ func verifyPKCE(challenge, method, verifier string) error {
 	if verifier == "" {
 		return fmt.Errorf("code_verifier is required")
 	}
+	// RFC 7636 §4.1: code_verifier must be 43-128 characters from the
+	// unreserved character set [A-Z]/[a-z]/[0-9]/"-"/"."/"_"/"~".
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return fmt.Errorf("code_verifier must be 43-128 characters (RFC 7636)")
+	}
+	if !pkceUnreservedRe.MatchString(verifier) {
+		return fmt.Errorf("code_verifier contains invalid characters (RFC 7636)")
+	}
 	normalizedMethod, err := normalizeChallengeMethod(method)
 	if err != nil {
 		return err
 	}
 	switch normalizedMethod {
-	case "plain":
-		if verifier != challenge {
-			return fmt.Errorf("pkce mismatch")
-		}
 	case "S256":
 		sum := sha256.Sum256([]byte(verifier))
 		derived := base64.RawURLEncoding.EncodeToString(sum[:])

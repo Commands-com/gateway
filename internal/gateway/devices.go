@@ -32,6 +32,7 @@ type listedDeviceSummary struct {
 	LastSeenAt  string `json:"last_seen_at,omitempty"`
 	DeviceClass string `json:"device_class,omitempty"`
 	Role        string `json:"role,omitempty"`
+	GrantID     string `json:"grant_id,omitempty"`
 }
 
 func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
@@ -74,24 +75,44 @@ func (h *Handler) PutDeviceIdentityKey(c fiber.Ctx) error {
 	if exists && !h.ownerMatchesPrincipal(rec.OwnerUID, rec.OwnerEmail, principal.UID, principal.Email) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
-	// Enforce per-owner device registration limit for new devices
-	if !exists {
-		ownerDeviceCount, countErr := h.store.CountDevicesByOwner(c.Context(), principal.UID)
-		if countErr != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to count devices"})
+	displayName := strings.TrimSpace(req.DisplayName)
+
+	if exists {
+		// For existing devices, use UpdateDeviceIdentity which atomically
+		// merges identity fields without clobbering live presence state
+		// (Connected, ConnectedAt, LastSeenAt, PresenceExpiresAt, etc.).
+		if err := h.store.UpdateDeviceIdentity(c.Context(), deviceID, func(dev *deviceRecord) {
+			dev.OwnerUID = principal.UID
+			dev.OwnerEmail = canonicalEmail(principal.Email)
+			if displayName != "" {
+				dev.DisplayName = displayName
+			}
+			dev.IdentityKey = publicKey
+			dev.UpdatedAt = now
+		}); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save device"})
 		}
-		if ownerDeviceCount >= maxDevicesPerOwner {
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too many registered devices"})
-		}
+		return c.SendStatus(fiber.StatusNoContent)
 	}
+
+	// New device — build a fresh record.
 	rec.DeviceID = deviceID
 	rec.OwnerUID = principal.UID
 	rec.OwnerEmail = canonicalEmail(principal.Email)
-	if displayName := strings.TrimSpace(req.DisplayName); displayName != "" {
+	if displayName != "" {
 		rec.DisplayName = displayName
 	}
 	rec.IdentityKey = publicKey
 	rec.UpdatedAt = now
+
+	// Enforce per-owner device registration limit for new devices.
+	ownerDeviceCount, countErr := h.store.CountDevicesByOwner(c.Context(), principal.UID)
+	if countErr != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to count devices"})
+	}
+	if ownerDeviceCount >= maxDevicesPerOwner {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too many registered devices"})
+	}
 	if err := h.store.SaveDevice(c.Context(), rec); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save device"})
 	}
@@ -266,20 +287,23 @@ func (h *Handler) listVisibleDeviceSummaries(ctx context.Context, uid, email str
 	if err != nil {
 		return nil, err
 	}
-	grantedDeviceIDs := make(map[string]struct{})
+	// Map deviceID → grantID for active grants so we can include the
+	// grant_id in the response for collaborators.
+	grantedDeviceIDs := make(map[string]string) // deviceID → grantID
 	for _, grant := range granteeGrants {
 		if grant == nil {
 			continue
 		}
 		if effectiveGrantStatus(grant, now) == "active" {
-			grantedDeviceIDs[grant.DeviceID] = struct{}{}
+			grantedDeviceIDs[grant.DeviceID] = grant.GrantID
 		}
 	}
 
 	// Build deduplicated record list with roles
 	type deviceWithRole struct {
-		rec  deviceRecord
-		role string
+		rec     deviceRecord
+		role    string
+		grantID string
 	}
 	seen := make(map[string]struct{}, len(ownedRecords)+len(grantedDeviceIDs))
 	candidates := make([]deviceWithRole, 0, len(ownedRecords)+len(grantedDeviceIDs))
@@ -287,7 +311,7 @@ func (h *Handler) listVisibleDeviceSummaries(ctx context.Context, uid, email str
 		seen[rec.DeviceID] = struct{}{}
 		candidates = append(candidates, deviceWithRole{rec: rec, role: "owner"})
 	}
-	for deviceID := range grantedDeviceIDs {
+	for deviceID, grantID := range grantedDeviceIDs {
 		if _, already := seen[deviceID]; already {
 			continue
 		}
@@ -295,7 +319,7 @@ func (h *Handler) listVisibleDeviceSummaries(ctx context.Context, uid, email str
 		if err != nil || !found {
 			continue
 		}
-		candidates = append(candidates, deviceWithRole{rec: rec, role: "collaborator"})
+		candidates = append(candidates, deviceWithRole{rec: rec, role: "collaborator", grantID: grantID})
 	}
 
 	out := make([]listedDeviceSummary, 0, len(candidates))
@@ -340,6 +364,7 @@ func (h *Handler) listVisibleDeviceSummaries(ctx context.Context, uid, email str
 			LastSeenAt:  lastSeenAt,
 			DeviceClass: "agent",
 			Role:        role,
+			GrantID:     c.grantID,
 		}
 		out = append(out, summary)
 	}

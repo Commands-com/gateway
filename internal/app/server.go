@@ -139,7 +139,8 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	gatewayGroup.Get("/health", auth.OptionalUser(jwtManager), gatewayHandler.Health)
 	gatewayGroup.Use(auth.RequireUser(jwtManager))
 
-	gatewayGroup.Put("/devices/:device_id/identity-key", auth.RequireScopes(auth.ScopeDevice), gatewayHandler.PutDeviceIdentityKey)
+	// No per-route scope gates — every authenticated user has full access.
+	gatewayGroup.Put("/devices/:device_id/identity-key", gatewayHandler.PutDeviceIdentityKey)
 	gatewayGroup.Get("/devices", gatewayHandler.ListDevices)
 	gatewayGroup.Get("/devices/events", gatewayHandler.GetDeviceEvents)
 	gatewayGroup.Get("/devices/:device_id/identity-key", gatewayHandler.GetDeviceIdentityKey)
@@ -152,11 +153,11 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 
 	gatewayGroup.Post("/sessions/:session_id/handshake/client-init", gatewayHandler.PostHandshakeClientInit)
 	gatewayGroup.Get("/sessions/:session_id/handshake/:handshake_id", gatewayHandler.GetHandshake)
-	gatewayGroup.Post("/sessions/:session_id/handshake/agent-ack", auth.RequireScopes(auth.ScopeDevice), gatewayHandler.PostHandshakeAgentAck)
+	gatewayGroup.Post("/sessions/:session_id/handshake/agent-ack", gatewayHandler.PostHandshakeAgentAck)
 	gatewayGroup.Post("/sessions/:session_id/messages", gatewayHandler.PostSessionMessage)
 	gatewayGroup.Get("/sessions/:session_id/events", gatewayHandler.GetSessionEvents)
 
-	gatewayGroup.Use("/agent/connect", auth.RequireScopes(auth.ScopeDevice), gatewayHandler.RequireAgentWebSocketUpgrade)
+	gatewayGroup.Use("/agent/connect", gatewayHandler.RequireAgentWebSocketUpgrade)
 	gatewayGroup.Get("/agent/connect", gatewayHandler.AgentConnectWebSocket())
 
 	gatewayGroup.Post("/integrations/routes", gatewayHandler.CreateIntegrationRoute)
@@ -165,7 +166,7 @@ func NewWithGatewayOptions(cfg *config.Config, gatewayOpts gateway.HandlerOption
 	gatewayGroup.Get("/integrations/routes", gatewayHandler.ListIntegrationRoutes)
 	gatewayGroup.Post("/integrations/routes/:route_id/rotate-token", gatewayHandler.RotateIntegrationRouteToken)
 
-	gatewayGroup.Use("/integrations/tunnel/connect", auth.RequireScopes(auth.ScopeDevice), gatewayHandler.RequireIntegrationTunnelUpgrade)
+	gatewayGroup.Use("/integrations/tunnel/connect", gatewayHandler.RequireIntegrationTunnelUpgrade)
 	gatewayGroup.Get("/integrations/tunnel/connect", gatewayHandler.IntegrationTunnelWebSocket())
 
 	app.All(

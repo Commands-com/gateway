@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type StateStore interface {
 	GetDevice(ctx context.Context, deviceID string) (deviceRecord, bool, error)
 	ListDevices(ctx context.Context) ([]deviceRecord, error)
 	ListDevicesByOwner(ctx context.Context, ownerUID string) ([]deviceRecord, error)
+	UpdateDeviceIdentity(ctx context.Context, deviceID string, fn func(*deviceRecord)) error
 	SetDeviceOnline(ctx context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error
 	SetDeviceOffline(ctx context.Context, deviceID, nodeID string) error
 	TouchDevicePresence(ctx context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error
@@ -63,6 +65,7 @@ type StateStore interface {
 	ListShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
 	ListShareGrantsByGranteeUID(ctx context.Context, granteeUID string) ([]*shareGrant, error)
 	ListAllShareGrantsByDevice(ctx context.Context, deviceID string) ([]*shareGrant, error)
+	CreateShareGrantIfAbsent(ctx context.Context, grant *shareGrant, now int64) (*shareGrant, bool, error)
 	DeleteShareGrantFromDeviceIndex(ctx context.Context, deviceID, grantID string) error
 	SaveInviteGrantMapping(ctx context.Context, tokenHash, grantID string) error
 	GetInviteGrantID(ctx context.Context, tokenHash string) (string, bool, error)
@@ -212,6 +215,37 @@ func (s *InMemoryStateStore) ListDevicesByOwner(_ context.Context, ownerUID stri
 		}
 	}
 	return out, nil
+}
+
+func (s *InMemoryStateStore) UpdateDeviceIdentity(_ context.Context, deviceID string, fn func(*deviceRecord)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dev, ok := s.devices[deviceID]
+	if !ok {
+		return fmt.Errorf("device not found: %s", deviceID)
+	}
+	oldOwner := dev.OwnerUID
+	fn(&dev)
+	dev.DeviceID = deviceID // prevent fn from changing the key
+	s.devices[deviceID] = dev
+	// Maintain owner index if owner changed.
+	if oldOwner != dev.OwnerUID {
+		if oldOwner != "" {
+			if ownerDevs, exists := s.devicesByOwner[oldOwner]; exists {
+				delete(ownerDevs, deviceID)
+				if len(ownerDevs) == 0 {
+					delete(s.devicesByOwner, oldOwner)
+				}
+			}
+		}
+		if dev.OwnerUID != "" {
+			if _, exists := s.devicesByOwner[dev.OwnerUID]; !exists {
+				s.devicesByOwner[dev.OwnerUID] = make(map[string]struct{})
+			}
+			s.devicesByOwner[dev.OwnerUID][deviceID] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func (s *InMemoryStateStore) SetDeviceOnline(_ context.Context, deviceID, nodeID string, at time.Time, ttl time.Duration) error {
@@ -529,6 +563,47 @@ func (s *InMemoryStateStore) ListAllShareGrantsByDevice(_ context.Context, devic
 	return out, nil
 }
 
+func (s *InMemoryStateStore) CreateShareGrantIfAbsent(_ context.Context, grant *shareGrant, now int64) (*shareGrant, bool, error) {
+	if grant == nil || grant.GrantID == "" || grant.DeviceID == "" || grant.GranteeEmail == "" {
+		return nil, false, fmt.Errorf("invalid grant")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if a pending or active grant already exists for this (deviceID, granteeEmail).
+	for _, existing := range s.grantsByDevice[grant.DeviceID] {
+		if existing == nil || existing.GranteeEmail != grant.GranteeEmail {
+			continue
+		}
+		status := existing.Status
+		if status == "pending" && existing.InviteTokenExpiresAt > 0 && now > existing.InviteTokenExpiresAt {
+			status = "expired"
+		}
+		if (status == "pending" || status == "active") && existing.GrantExpiresAt > 0 && now > existing.GrantExpiresAt {
+			status = "expired"
+		}
+		if status == "pending" || status == "active" {
+			return nil, false, nil // duplicate exists
+		}
+	}
+
+	// No duplicate — persist the grant and update indexes.
+	stored := cloneShareGrant(grant)
+	s.grants[stored.GrantID] = stored
+	s.putShareGrantInDeviceIndexLocked(stored.DeviceID, stored)
+	if _, ok := s.allGrantsByDevice[stored.DeviceID]; !ok {
+		s.allGrantsByDevice[stored.DeviceID] = make(map[string]struct{})
+	}
+	s.allGrantsByDevice[stored.DeviceID][stored.GrantID] = struct{}{}
+	if stored.GranteeUID != "" {
+		if _, ok := s.grantsByGrantee[stored.GranteeUID]; !ok {
+			s.grantsByGrantee[stored.GranteeUID] = make(map[string]struct{})
+		}
+		s.grantsByGrantee[stored.GranteeUID][stored.GrantID] = struct{}{}
+	}
+	return cloneShareGrant(stored), true, nil
+}
+
 func (s *InMemoryStateStore) DeleteShareGrantFromDeviceIndex(_ context.Context, deviceID, grantID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -638,6 +713,34 @@ func (s *InMemoryStateStore) SaveIntegrationRoute(_ context.Context, route *inte
 				delete(s.integrationRouteOwnerIDs, old.OwnerUID)
 			}
 		}
+	}
+	return nil
+}
+
+func (s *InMemoryStateStore) SaveIntegrationRouteWithOwnerLimit(_ context.Context, route *integrationRoute, maxRoutes int) error {
+	if route == nil || route.RouteID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If this is a new route (not an update), enforce the per-owner limit.
+	if _, exists := s.integrationRoutes[route.RouteID]; !exists && route.OwnerUID != "" {
+		if ownerRoutes, ok := s.integrationRouteOwnerIDs[route.OwnerUID]; ok && len(ownerRoutes) >= maxRoutes {
+			return fmt.Errorf("route_limit_exceeded")
+		}
+	}
+
+	stored := cloneIntegrationRoute(route)
+	if stored.Version <= 0 {
+		stored.Version = 1
+	}
+	s.integrationRoutes[stored.RouteID] = stored
+	if stored.OwnerUID != "" {
+		if _, ok := s.integrationRouteOwnerIDs[stored.OwnerUID]; !ok {
+			s.integrationRouteOwnerIDs[stored.OwnerUID] = make(map[string]struct{})
+		}
+		s.integrationRouteOwnerIDs[stored.OwnerUID][stored.RouteID] = struct{}{}
 	}
 	return nil
 }

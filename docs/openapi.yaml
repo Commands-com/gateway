@@ -178,7 +178,7 @@ paths:
   /gateway/v1/devices/{device_id}/identity-key:
     put:
       summary: Register or update device identity key
-      description: Requires `device` scope.
+      description: Requires authentication.
       parameters:
         - in: path
           name: device_id
@@ -339,7 +339,7 @@ paths:
     post:
       summary: Agent acknowledgment for handshake
       description: |
-        Requires `device` scope.
+        Requires authentication.
         Verifies transcript hash and agent identity signature before promoting handshake to `agent_acknowledged`.
       parameters:
         - in: path
@@ -415,7 +415,7 @@ paths:
     get:
       summary: Agent WebSocket connection
       description: |
-        Requires `device` scope and HTTP Upgrade to WebSocket.
+        Requires authentication and HTTP Upgrade to WebSocket.
       responses:
         '101':
           description: WebSocket upgrade successful
@@ -517,7 +517,7 @@ paths:
     get:
       summary: Integration tunnel WebSocket connection
       description: |
-        Requires `device` scope and HTTP Upgrade to WebSocket.
+        Requires authentication and HTTP Upgrade to WebSocket.
       responses:
         '101':
           description: WebSocket upgrade successful

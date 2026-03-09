@@ -360,7 +360,7 @@ const Auth = {
     const params = new URLSearchParams({
       response_type: 'code',
       redirect_uri: CONSOLE_URL,
-      scope: 'openid profile email device',
+      scope: 'profile email',
       code_challenge: challenge,
       code_challenge_method: 'S256',
     });

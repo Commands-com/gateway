@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -53,8 +54,18 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 	// If the lease is held by a different node, still proceed — sendTunnelRequest
 	// will forward via the MessageBus for cross-node routing.
 
+	// Enforce body size limit BEFORE reading the body into memory to prevent
+	// large requests from being fully buffered before rejection. Check
+	// Content-Length header first (cheap), then verify actual body length.
+	maxBody := routeCopy.MaxBodyBytes
+	if maxBody <= 0 {
+		maxBody = defaultIntegrationMaxBodyBytes
+	}
+	if contentLen := c.Request().Header.ContentLength(); contentLen > maxBody {
+		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
+	}
 	bodyBytes := c.Body()
-	if routeCopy.MaxBodyBytes > 0 && len(bodyBytes) > routeCopy.MaxBodyBytes {
+	if len(bodyBytes) > maxBody {
 		return c.SendStatus(fiber.StatusRequestEntityTooLarge)
 	}
 
@@ -106,16 +117,23 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		"deadline_ms":       routeCopy.DeadlineMs,
 	}
 
-	inflight, err := h.sendTunnelRequest(c.Context(), routeID, requestFrame)
+	deadline := time.Duration(routeCopy.DeadlineMs) * time.Millisecond
+	if deadline <= 0 {
+		deadline = time.Duration(defaultIntegrationDeadlineMS) * time.Millisecond
+	}
+
+	// Use a detached context for sendTunnelRequest because it spawns
+	// background goroutines that outlive the Fiber handler. Fiber recycles
+	// the underlying fasthttp.RequestCtx after the handler returns, so
+	// passing c.Context() would cause data races or panics.
+	tunnelCtx, tunnelCancel := context.WithTimeout(context.Background(), deadline)
+	defer tunnelCancel()
+	inflight, err := h.sendTunnelRequest(tunnelCtx, routeID, requestFrame)
 	if err != nil {
 		slog.Warn("tunnel send failed", "route", routeID, "err", err)
 		return c.SendStatus(fiber.StatusServiceUnavailable)
 	}
 
-	deadline := time.Duration(routeCopy.DeadlineMs) * time.Millisecond
-	if deadline <= 0 {
-		deadline = time.Duration(defaultIntegrationDeadlineMS) * time.Millisecond
-	}
 	timer := time.NewTimer(deadline)
 	defer timer.Stop()
 
@@ -128,11 +146,24 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 			if len(pair) != 2 {
 				continue
 			}
-			headLower := strings.ToLower(pair[0])
-			if headLower == "transfer-encoding" || headLower == "connection" {
+			headerKey := pair[0]
+			headerVal := pair[1]
+			// Reject headers containing CRLF characters to prevent HTTP
+			// response splitting attacks. Even though fasthttp typically
+			// sanitizes these, we enforce it explicitly for defense in depth.
+			if containsCRLF(headerKey) || containsCRLF(headerVal) {
+				slog.Warn("dropping tunnel response header with CRLF",
+					"route", routeID, "header", headerKey)
 				continue
 			}
-			c.Set(pair[0], pair[1])
+			headLower := strings.ToLower(headerKey)
+			// Filter out security-sensitive and hop-by-hop headers that a
+			// malicious agent could abuse for session fixation, response
+			// splitting, or HTTP desync.
+			if isBlockedTunnelResponseHeader(headLower) {
+				continue
+			}
+			c.Set(headerKey, headerVal)
 		}
 		if resp.BodyBase64 != "" {
 			body, err := base64.StdEncoding.DecodeString(resp.BodyBase64)
@@ -145,9 +176,45 @@ func (h *Handler) HandlePublicIngress(c fiber.Ctx) error {
 		if resp.Status <= 0 {
 			return c.SendStatus(fiber.StatusBadGateway)
 		}
-		return c.SendStatus(resp.Status)
+		return c.Status(resp.Status).Send(nil)
 	case <-timer.C:
 		slog.Warn("deadline exceeded", "route", routeID, "request", requestID, "deadline_ms", routeCopy.DeadlineMs)
 		return c.SendStatus(fiber.StatusGatewayTimeout)
 	}
+}
+
+// blockedTunnelResponseHeaders is the set of HTTP headers that must not be
+// passed through from the agent's tunnel response to the public HTTP client.
+// These include hop-by-hop headers, headers that could cause HTTP desync, and
+// security-sensitive headers that could enable session fixation or CORS bypass.
+var blockedTunnelResponseHeaders = map[string]struct{}{
+	"host":                             {},
+	"connection":                       {},
+	"transfer-encoding":                {},
+	"content-length":                   {},
+	"set-cookie":                       {},
+	"set-cookie2":                      {},
+	"proxy-authenticate":               {},
+	"proxy-authorization":              {},
+	"te":                               {},
+	"trailer":                          {},
+	"upgrade":                          {},
+	"keep-alive":                       {},
+	"access-control-allow-origin":      {},
+	"access-control-allow-credentials": {},
+	"access-control-allow-headers":     {},
+	"access-control-allow-methods":     {},
+	"access-control-expose-headers":    {},
+	"access-control-max-age":           {},
+}
+
+func isBlockedTunnelResponseHeader(headerLower string) bool {
+	_, blocked := blockedTunnelResponseHeaders[headerLower]
+	return blocked
+}
+
+// containsCRLF returns true if s contains any carriage return or line feed
+// characters that could be used for HTTP response splitting.
+func containsCRLF(s string) bool {
+	return strings.ContainsAny(s, "\r\n")
 }
