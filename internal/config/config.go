@@ -190,8 +190,8 @@ func (c *Config) Validate() error {
 	if c.IdempotencyTTLSeconds <= 0 {
 		return fmt.Errorf("IDEMPOTENCY_TTL_SECONDS must be > 0")
 	}
-	if c.TransportTokenTTL <= 0 {
-		return fmt.Errorf("TRANSPORT_TOKEN_TTL_SECONDS must be > 0")
+	if c.TransportTokenTTL < 30*time.Second {
+		return fmt.Errorf("TRANSPORT_TOKEN_TTL_SECONDS must be >= 30 (renewal happens at TTL/2)")
 	}
 
 	c.OAuthDefaultClientID = strings.TrimSpace(c.OAuthDefaultClientID)

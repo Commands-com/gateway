@@ -75,6 +75,7 @@ func (tc *tunnelConn) writeJSON(payload map[string]any) error {
 	}
 	tc.sendMu.Lock()
 	defer tc.sendMu.Unlock()
+	_ = tc.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	return tc.conn.WriteMessage(websocket.TextMessage, raw)
 }
 

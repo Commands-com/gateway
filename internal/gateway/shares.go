@@ -56,20 +56,6 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not own this device"})
 	}
 
-	grantsForDevice, err := h.store.ListShareGrantsByDevice(c.Context(), deviceID)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read grants"})
-	}
-	for _, grant := range grantsForDevice {
-		if grant == nil || grant.GranteeEmail != granteeEmail {
-			continue
-		}
-		status := effectiveGrantStatus(grant, now)
-		if status == "pending" || status == "active" {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "an active or pending grant already exists for this email and device"})
-		}
-	}
-
 	token, err := httputil.RandomToken(32)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate invite token"})
@@ -91,17 +77,31 @@ func (h *Handler) CreateShareInvite(c fiber.Ctx) error {
 		CreatedAt:            now,
 		UpdatedAt:            now,
 	}
-	if err := h.store.SaveShareGrant(c.Context(), grant); err != nil {
+	// Use atomic create-if-absent to prevent duplicate grants from
+	// concurrent requests for the same (deviceID, granteeEmail) pair.
+	created, ok, err := h.store.CreateShareGrantIfAbsent(c.Context(), grant, now)
+	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save grant"})
 	}
+	if !ok {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "an active or pending grant already exists for this email and device"})
+	}
+	grant = created
 	if err := h.store.SaveInviteGrantMapping(c.Context(), tokenHash, grantID); err != nil {
+		// Roll back the persisted grant to prevent an orphaned pending
+		// grant that has no redeemable invite token (which would
+		// permanently block future invites for this email/device pair).
+		grant.Status = "revoked"
+		grant.UpdatedAt = time.Now().UTC().Unix()
+		_ = h.store.SaveShareGrant(c.Context(), grant)
+		_ = h.store.DeleteShareGrantFromDeviceIndex(c.Context(), grant.DeviceID, grant.GrantID)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save invite"})
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"grantId":              grantID,
 		"status":               "pending",
-		"inviteUrl":            inviteURL(h.cfg.PublicBaseURL, token),
+		"inviteUrl":            inviteURL(h.cfg.FrontendURL, h.cfg.PublicBaseURL, token),
 		"inviteTokenExpiresAt": inviteExpiresAt,
 		"grantExpiresAt":       req.GrantExpiresAt,
 	})

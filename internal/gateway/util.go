@@ -79,11 +79,20 @@ func hashToken(token string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func inviteURL(frontendURL, token string) string {
+func inviteURL(frontendURL, publicBaseURL, token string) string {
+	// Prefer the configured frontend URL when set, so deployments with a
+	// separate frontend domain or custom share-accept flow keep working.
+	// Fall back to the built-in console when no frontend is configured.
 	base := strings.TrimRight(strings.TrimSpace(frontendURL), "/")
-	if base == "" {
-		base = "https://example.com"
+	if base == "" || base == "https://example.com" {
+		base = strings.TrimRight(strings.TrimSpace(publicBaseURL), "/")
+		if base == "" {
+			base = "https://example.com"
+		}
+		// Stock installs use the built-in console.
+		return base + "/console#/share/" + token
 	}
+	// Custom frontend — use the frontend's share path convention.
 	return base + "/share/" + token
 }
 
