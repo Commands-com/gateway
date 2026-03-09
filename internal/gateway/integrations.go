@@ -23,7 +23,7 @@ const (
 	defaultIntegrationDeadlineMS      = 2500
 	minIntegrationDeadlineMS          = 500
 	maxIntegrationDeadlineMS          = 10000
-	defaultIntegrationMaxBodyBytes    = 1024 * 1024     // 1 MB — limits memory per request for base64 encoding
+	defaultIntegrationMaxBodyBytes    = 1024 * 1024 // 1 MB — limits memory per request for base64 encoding
 	minIntegrationMaxBodyBytes        = 1024
 	maxIntegrationMaxBodyBytes        = 5 * 1024 * 1024 // 5 MB — hard cap; base64 expands to ~6.7 MB, within 16 MB frame limit
 	defaultIntegrationTokenMaxAgeDays = 90
