@@ -16,17 +16,26 @@ import (
 	"oss-commands-gateway/internal/jwt"
 )
 
+// s256Pair returns a valid PKCE S256 verifier and challenge.
+func s256Pair() (verifier, challenge string) {
+	verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+	return
+}
+
 func TestAuthorizationCodeAndRefreshFlow(t *testing.T) {
 	app := newDemoOAuthTestApp(t)
+	verifier, challenge := s256Pair()
 
 	authorizeValues := url.Values{}
 	authorizeValues.Set("response_type", "code")
-	authorizeValues.Set("client_id", "desktop-client")
+	authorizeValues.Set("client_id", "oss-gateway-public-client")
 	authorizeValues.Set("redirect_uri", "http://localhost:61696/callback")
-	authorizeValues.Set("scope", "openid gateway:session")
+	authorizeValues.Set("scope", "profile email")
 	authorizeValues.Set("state", "st-123")
-	authorizeValues.Set("code_challenge", "verifier-123")
-	authorizeValues.Set("code_challenge_method", "plain")
+	authorizeValues.Set("code_challenge", challenge)
+	authorizeValues.Set("code_challenge_method", "S256")
 	authorizeValues.Set("response_mode", "json")
 	authorizeValues.Set("demo_email", "alice@example.com")
 	authorizeValues.Set("demo_name", "Alice")
@@ -39,10 +48,10 @@ func TestAuthorizationCodeAndRefreshFlow(t *testing.T) {
 
 	tokenValues := url.Values{}
 	tokenValues.Set("grant_type", "authorization_code")
-	tokenValues.Set("client_id", "desktop-client")
+	tokenValues.Set("client_id", "oss-gateway-public-client")
 	tokenValues.Set("code", code)
 	tokenValues.Set("redirect_uri", "http://localhost:61696/callback")
-	tokenValues.Set("code_verifier", "verifier-123")
+	tokenValues.Set("code_verifier", verifier)
 
 	tokenResp := mustDoForm(t, app, "POST", "/oauth/token", tokenValues, fiber.StatusOK)
 	accessToken, _ := tokenResp["access_token"].(string)
@@ -51,18 +60,28 @@ func TestAuthorizationCodeAndRefreshFlow(t *testing.T) {
 		t.Fatalf("expected access and refresh tokens in exchange response")
 	}
 
+	// Refresh should return a NEW refresh token (rotation)
 	refreshValues := url.Values{}
 	refreshValues.Set("grant_type", "refresh_token")
 	refreshValues.Set("refresh_token", refreshToken)
 	refreshResp := mustDoForm(t, app, "POST", "/oauth/token", refreshValues, fiber.StatusOK)
-	if token, _ := refreshResp["access_token"].(string); token == "" {
+	newAccessToken, _ := refreshResp["access_token"].(string)
+	newRefreshToken, _ := refreshResp["refresh_token"].(string)
+	if newAccessToken == "" {
 		t.Fatalf("expected access_token on refresh flow")
 	}
+	if newRefreshToken == "" {
+		t.Fatalf("expected new refresh_token on refresh flow (rotation)")
+	}
 
-	revokeValues := url.Values{}
-	revokeValues.Set("token", refreshToken)
-	mustDoForm(t, app, "POST", "/oauth/token/revoke", revokeValues, fiber.StatusOK)
+	// New refresh token should work (use it BEFORE replaying old one,
+	// since replay triggers family revocation per OAuth 2.0 Security BCP).
+	refreshValues2 := url.Values{}
+	refreshValues2.Set("grant_type", "refresh_token")
+	refreshValues2.Set("refresh_token", newRefreshToken)
+	mustDoForm(t, app, "POST", "/oauth/token", refreshValues2, fiber.StatusOK)
 
+	// Old refresh token should be invalid (consumed)
 	mustDoForm(t, app, "POST", "/oauth/token", refreshValues, fiber.StatusBadRequest)
 }
 
@@ -71,7 +90,7 @@ func TestAuthorizeRejectsDisallowedRedirectURI(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "desktop-client")
+	values.Set("client_id", "oss-gateway-public-client")
 	values.Set("redirect_uri", "http://not-allowed/callback")
 	values.Set("response_mode", "json")
 	values.Set("demo_email", "alice@example.com")
@@ -84,14 +103,15 @@ func TestAuthorizeRejectsDisallowedRedirectURI(t *testing.T) {
 
 func TestAuthorizeAllowsLoopbackRedirectWithEphemeralPort(t *testing.T) {
 	app := newDemoOAuthTestApp(t)
+	_, challenge := s256Pair()
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "desktop-client")
+	values.Set("client_id", "oss-gateway-public-client")
 	values.Set("redirect_uri", "http://localhost:49152/callback")
 	values.Set("response_mode", "json")
-	values.Set("code_challenge", "verifier-123")
-	values.Set("code_challenge_method", "plain")
+	values.Set("code_challenge", challenge)
+	values.Set("code_challenge_method", "S256")
 	values.Set("demo_email", "alice@example.com")
 
 	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusOK)
@@ -105,16 +125,52 @@ func TestAuthorizeRejectsLoopbackRedirectWrongPath(t *testing.T) {
 
 	values := url.Values{}
 	values.Set("response_type", "code")
-	values.Set("client_id", "desktop-client")
+	values.Set("client_id", "oss-gateway-public-client")
 	values.Set("redirect_uri", "http://localhost:49152/not-callback")
 	values.Set("response_mode", "json")
 	values.Set("code_challenge", "verifier-123")
-	values.Set("code_challenge_method", "plain")
+	values.Set("code_challenge_method", "S256")
 	values.Set("demo_email", "alice@example.com")
 
 	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusBadRequest)
 	if resp["error"] != "redirect_uri not allowed" {
 		t.Fatalf("expected redirect_uri validation error, got %v", resp["error"])
+	}
+}
+
+func TestUnknownScopeIsRejected(t *testing.T) {
+	app := newDemoOAuthTestApp(t)
+	_, challenge := s256Pair()
+
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", "oss-gateway-public-client")
+	values.Set("redirect_uri", "http://localhost:61696/callback")
+	values.Set("scope", "profile device")
+	values.Set("code_challenge", challenge)
+	values.Set("code_challenge_method", "S256")
+	values.Set("response_mode", "json")
+	values.Set("demo_email", "alice@example.com")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusBadRequest)
+	if resp["error"] != "invalid_scope" {
+		t.Fatalf("expected invalid_scope, got %v", resp["error"])
+	}
+}
+
+func TestAuthorizeRejectsUnknownClientID(t *testing.T) {
+	app := newDemoOAuthTestApp(t)
+
+	values := url.Values{}
+	values.Set("response_type", "code")
+	values.Set("client_id", "unknown-client")
+	values.Set("redirect_uri", "http://localhost:61696/callback")
+	values.Set("response_mode", "json")
+	values.Set("demo_email", "alice@example.com")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusBadRequest)
+	if resp["error"] != "invalid_client" {
+		t.Fatalf("expected invalid_client, got %v", resp["error"])
 	}
 }
 
@@ -159,15 +215,16 @@ func TestDemoDeterministicUID(t *testing.T) {
 
 func TestDemoEmailUIDStabilityAcrossFlows(t *testing.T) {
 	app := newDemoOAuthTestApp(t)
+	verifier, challenge := s256Pair()
 
 	authorize := func(email string) string {
 		values := url.Values{}
 		values.Set("response_type", "code")
-		values.Set("client_id", "desktop-client")
+		values.Set("client_id", "oss-gateway-public-client")
 		values.Set("redirect_uri", "http://localhost:61696/callback")
-		values.Set("scope", "openid device")
-		values.Set("code_challenge", "test-verifier")
-		values.Set("code_challenge_method", "plain")
+		values.Set("scope", "profile")
+		values.Set("code_challenge", challenge)
+		values.Set("code_challenge_method", "S256")
 		values.Set("response_mode", "json")
 		values.Set("demo_email", email)
 		resp := mustDoForm(t, app, "POST", "/oauth/authorize", values, fiber.StatusOK)
@@ -179,9 +236,10 @@ func TestDemoEmailUIDStabilityAcrossFlows(t *testing.T) {
 
 		tokenValues := url.Values{}
 		tokenValues.Set("grant_type", "authorization_code")
+		tokenValues.Set("client_id", "oss-gateway-public-client")
 		tokenValues.Set("code", code)
 		tokenValues.Set("redirect_uri", "http://localhost:61696/callback")
-		tokenValues.Set("code_verifier", "test-verifier")
+		tokenValues.Set("code_verifier", verifier)
 		tokenResp := mustDoForm(t, app, "POST", "/oauth/token", tokenValues, fiber.StatusOK)
 
 		accessToken, _ := tokenResp["access_token"].(string)
@@ -195,8 +253,6 @@ func TestDemoEmailUIDStabilityAcrossFlows(t *testing.T) {
 	token1 := authorize("alice@example.com")
 	token2 := authorize("Alice@Example.com")
 
-	cfg := newDemoOAuthTestApp(t) // need jwt manager to parse
-	_ = cfg
 	// Parse both tokens and verify subjects match
 	jm, err := jwt.NewManager("test-signing-secret-at-least-32-bytes-long", "http://localhost:8080", "commands-gateway-test")
 	if err != nil {
@@ -230,9 +286,12 @@ func TestVerifyPKCE(t *testing.T) {
 		verifier  string
 		wantErr   bool
 	}{
-		{name: "plain ok", challenge: "abc", method: "plain", verifier: "abc", wantErr: false},
-		{name: "plain mismatch", challenge: "abc", method: "plain", verifier: "def", wantErr: true},
 		{name: "s256 ok", challenge: s256Challenge, method: "S256", verifier: s256Verifier, wantErr: false},
+		{name: "s256 mismatch", challenge: s256Challenge, method: "S256", verifier: "wrong-verifier-that-is-at-least-43-chars-long-for-rfc", wantErr: true},
+		{name: "plain rejected", challenge: "abc", method: "plain", verifier: "abc", wantErr: true},
+		{name: "verifier too short", challenge: s256Challenge, method: "S256", verifier: "short", wantErr: true},
+		{name: "verifier too long", challenge: s256Challenge, method: "S256", verifier: strings.Repeat("a", 129), wantErr: true},
+		{name: "verifier invalid chars", challenge: s256Challenge, method: "S256", verifier: strings.Repeat("a", 43) + "@", wantErr: true},
 	}
 
 	for _, tc := range tests {
@@ -252,14 +311,15 @@ func newDemoOAuthTestApp(t *testing.T) *fiber.App {
 	t.Helper()
 
 	cfg := &config.Config{
-		PublicBaseURL:     "http://localhost:8080",
-		RedirectAllowlist: []string{"http://localhost:61696/callback", "urn:ietf:wg:oauth:2.0:oob"},
-		AuthMode:          config.AuthModeDemo,
-		AuthCodeTTL:       5 * time.Minute,
-		AccessTokenTTL:    1 * time.Hour,
-		RefreshTokenTTL:   24 * time.Hour,
-		Audience:          "commands-gateway-test",
-		JWTSigningKey:     "test-signing-secret-at-least-32-bytes-long",
+		PublicBaseURL:        "http://localhost:8080",
+		RedirectAllowlist:    []string{"http://localhost:61696/callback", "urn:ietf:wg:oauth:2.0:oob"},
+		AuthMode:             config.AuthModeDemo,
+		AuthCodeTTL:          5 * time.Minute,
+		AccessTokenTTL:       1 * time.Hour,
+		RefreshTokenTTL:      24 * time.Hour,
+		Audience:             "commands-gateway-test",
+		JWTSigningKey:        "test-signing-secret-at-least-32-bytes-long",
+		OAuthDefaultClientID: "oss-gateway-public-client",
 	}
 	jm, err := jwt.NewManager(cfg.JWTSigningKey, cfg.PublicBaseURL, cfg.Audience)
 	if err != nil {

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -22,13 +23,15 @@ const (
 	defaultIntegrationDeadlineMS      = 2500
 	minIntegrationDeadlineMS          = 500
 	maxIntegrationDeadlineMS          = 10000
-	defaultIntegrationMaxBodyBytes    = 10 * 1024 * 1024
+	defaultIntegrationMaxBodyBytes    = 1024 * 1024     // 1 MB — limits memory per request for base64 encoding
 	minIntegrationMaxBodyBytes        = 1024
-	maxIntegrationMaxBodyBytes        = 10 * 1024 * 1024
+	maxIntegrationMaxBodyBytes        = 5 * 1024 * 1024 // 5 MB — hard cap; base64 expands to ~6.7 MB, within 16 MB frame limit
 	defaultIntegrationTokenMaxAgeDays = 90
 	minIntegrationTokenMaxAgeDays     = 1
 	maxIntegrationTokenMaxAgeDays     = 365
 	minIntegrationRouteTokenLength    = 43
+	maxIntegrationRouteTokenLength    = 128
+	maxIntegrationRoutesPerOwner      = 100
 )
 
 type integrationRoute struct {
@@ -193,6 +196,9 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		if len(plainToken) < minIntegrationRouteTokenLength {
 			return c.Status(fiber.StatusUnprocessableEntity).JSON(integrationErrorResponse("token_validation_failed", fmt.Sprintf("route_token must be at least %d characters", minIntegrationRouteTokenLength), nil))
 		}
+		if len(plainToken) > maxIntegrationRouteTokenLength {
+			return c.Status(fiber.StatusUnprocessableEntity).JSON(integrationErrorResponse("token_validation_failed", fmt.Sprintf("route_token must be at most %d characters", maxIntegrationRouteTokenLength), nil))
+		}
 		if !routeTokenCharset.MatchString(plainToken) {
 			return c.Status(fiber.StatusUnprocessableEntity).JSON(integrationErrorResponse("token_validation_failed", "route_token must contain only [A-Za-z0-9_-]", nil))
 		}
@@ -226,8 +232,22 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 		TokenCurrentHash: hashRouteToken(plainToken),
 	}
 
-	if err := h.store.SaveIntegrationRoute(c.Context(), route); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+	// Use atomic save-with-limit to enforce the per-owner route cap
+	// under a single lock so concurrent requests cannot bypass it.
+	if limiter, ok := h.store.(interface {
+		SaveIntegrationRouteWithOwnerLimit(ctx context.Context, route *integrationRoute, maxRoutes int) error
+	}); ok {
+		if err := limiter.SaveIntegrationRouteWithOwnerLimit(c.Context(), route, maxIntegrationRoutesPerOwner); err != nil {
+			if err.Error() == "route_limit_exceeded" {
+				return c.Status(fiber.StatusTooManyRequests).JSON(integrationErrorResponse("route_limit_exceeded",
+					fmt.Sprintf("Maximum of %d integration routes per owner reached", maxIntegrationRoutesPerOwner), nil))
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		}
+	} else {
+		if err := h.store.SaveIntegrationRoute(c.Context(), route); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to save route", nil))
+		}
 	}
 
 	publicURL := integrationPublicURL(h.cfg.PublicBaseURL, routeID, plainToken)

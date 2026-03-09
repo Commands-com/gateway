@@ -10,12 +10,6 @@ import (
 	"oss-commands-gateway/internal/jwt"
 )
 
-const (
-	ScopeDevice         = "device"
-	ScopeGatewaySession = "gateway:session"
-	ScopeGatewayShare   = "gateway:share"
-)
-
 type Principal struct {
 	UID         string   `json:"uid"`
 	Email       string   `json:"email,omitempty"`

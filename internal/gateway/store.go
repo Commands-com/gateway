@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -638,6 +639,34 @@ func (s *InMemoryStateStore) SaveIntegrationRoute(_ context.Context, route *inte
 				delete(s.integrationRouteOwnerIDs, old.OwnerUID)
 			}
 		}
+	}
+	return nil
+}
+
+func (s *InMemoryStateStore) SaveIntegrationRouteWithOwnerLimit(_ context.Context, route *integrationRoute, maxRoutes int) error {
+	if route == nil || route.RouteID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// If this is a new route (not an update), enforce the per-owner limit.
+	if _, exists := s.integrationRoutes[route.RouteID]; !exists && route.OwnerUID != "" {
+		if ownerRoutes, ok := s.integrationRouteOwnerIDs[route.OwnerUID]; ok && len(ownerRoutes) >= maxRoutes {
+			return fmt.Errorf("route_limit_exceeded")
+		}
+	}
+
+	stored := cloneIntegrationRoute(route)
+	if stored.Version <= 0 {
+		stored.Version = 1
+	}
+	s.integrationRoutes[stored.RouteID] = stored
+	if stored.OwnerUID != "" {
+		if _, ok := s.integrationRouteOwnerIDs[stored.OwnerUID]; !ok {
+			s.integrationRouteOwnerIDs[stored.OwnerUID] = make(map[string]struct{})
+		}
+		s.integrationRouteOwnerIDs[stored.OwnerUID][stored.RouteID] = struct{}{}
 	}
 	return nil
 }
