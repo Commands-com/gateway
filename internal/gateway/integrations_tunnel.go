@@ -82,6 +82,7 @@ func (tc *tunnelConn) writeJSON(payload map[string]any) error {
 func (tc *tunnelConn) closeWithMessage(code int, reason string) {
 	tc.sendMu.Lock()
 	defer tc.sendMu.Unlock()
+	_ = tc.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_ = tc.conn.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(code, reason),
