@@ -270,6 +270,7 @@ const OAUTH = BASE + '/oauth';
 const CONSOLE_URL = BASE + '/console';
 const STORAGE_KEY = 'gw_console_auth';
 const PKCE_KEY = 'gw_console_pkce';
+const DEEPLINK_KEY = 'gw_console_deeplink';
 
 // ========== Utilities ==========
 function $(sel) { return document.querySelector(sel); }
@@ -312,6 +313,54 @@ function showModal(html) {
 }
 function closeModal() { $('#modal-root').innerHTML = ''; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ========== Deep-link params (preserved across OAuth redirect) ==========
+const DeepLink = {
+  capture() {
+    const params = new URLSearchParams(location.search);
+    const deviceId = params.get('device_id');
+    const onboarding = params.get('onboarding') === '1';
+    const source = params.get('source') || '';
+    if (!deviceId && !onboarding && !source) return;
+    sessionStorage.setItem(DEEPLINK_KEY, JSON.stringify({ deviceId, onboarding, source, ts: Date.now() }));
+    // Clean deep-link params from URL (keep ?code= for OAuth callback)
+    if (!params.get('code')) {
+      history.replaceState(null, '', CONSOLE_URL);
+    }
+  },
+
+  consume() {
+    const raw = sessionStorage.getItem(DEEPLINK_KEY);
+    sessionStorage.removeItem(DEEPLINK_KEY);
+    if (!raw) return null;
+    try {
+      const link = JSON.parse(raw);
+      // Expire after 5 minutes to avoid stale deep-links from abandoned logins
+      if (link.ts && Date.now() - link.ts > 5 * 60 * 1000) return null;
+      return link;
+    } catch { return null; }
+  },
+
+  async apply() {
+    const link = this.consume();
+    if (!link) return;
+    if (!link.deviceId) return;
+
+    // Wait for the target device to appear and come online
+    const deviceId = link.deviceId;
+    for (let i = 0; i < 15; i++) {
+      const device = Devices.items.find(d => d.device_id === deviceId);
+      if (device && device.connected) {
+        Sessions.createFor(deviceId);
+        return;
+      }
+      await sleep(500);
+    }
+  },
+};
+
+// Capture deep-link params before OAuth redirect strips them
+DeepLink.capture();
 
 // ========== Auth (redirect-based OAuth + PKCE) ==========
 const Auth = {
@@ -1132,6 +1181,7 @@ const App = {
     Dashboard.refresh();
     await Devices.load();
     Devices.startSSE();
+    DeepLink.apply();
   }
 };
 
