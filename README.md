@@ -253,5 +253,6 @@ ALLOW_ORIGINS=https://app.example.com
 
 ## Additional Docs
 
+- [Contributing](./CONTRIBUTING.md)
 - OpenAPI spec: [`docs/openapi.yaml`](./docs/openapi.yaml)
 - Release checklist: [`docs/release.md`](./docs/release.md)
