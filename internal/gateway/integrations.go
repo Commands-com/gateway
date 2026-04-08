@@ -23,9 +23,9 @@ const (
 	defaultIntegrationDeadlineMS      = 2500
 	minIntegrationDeadlineMS          = 500
 	maxIntegrationDeadlineMS          = 10000
-	defaultIntegrationMaxBodyBytes    = 1024 * 1024 // 1 MB — limits memory per request for base64 encoding
+	defaultIntegrationMaxBodyBytes    = 10 * 1024 * 1024 // 10 MB — matches desktop/spec defaults while staying under the 16 MB WS frame cap after base64 inflation
 	minIntegrationMaxBodyBytes        = 1024
-	maxIntegrationMaxBodyBytes        = 5 * 1024 * 1024 // 5 MB — hard cap; base64 expands to ~6.7 MB, within 16 MB frame limit
+	maxIntegrationMaxBodyBytes        = 10 * 1024 * 1024 // 10 MB — base64 expands to ~13.3 MB, still within the 16 MB tunnel frame limit
 	defaultIntegrationTokenMaxAgeDays = 90
 	minIntegrationTokenMaxAgeDays     = 1
 	maxIntegrationTokenMaxAgeDays     = 365
@@ -177,7 +177,9 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 
 	maxBodyBytes := defaultIntegrationMaxBodyBytes
 	if req.MaxBodyBytes != nil {
-		maxBodyBytes = *req.MaxBodyBytes
+		if *req.MaxBodyBytes != 0 {
+			maxBodyBytes = *req.MaxBodyBytes
+		}
 		if maxBodyBytes < minIntegrationMaxBodyBytes || maxBodyBytes > maxIntegrationMaxBodyBytes {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", fmt.Sprintf("max_body_bytes must be between %d and %d", minIntegrationMaxBodyBytes, maxIntegrationMaxBodyBytes), nil))
 		}
@@ -320,7 +322,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		}
 	}
 	if req.MaxBodyBytes != nil {
-		if *req.MaxBodyBytes < minIntegrationMaxBodyBytes || *req.MaxBodyBytes > maxIntegrationMaxBodyBytes {
+		if *req.MaxBodyBytes != 0 && (*req.MaxBodyBytes < minIntegrationMaxBodyBytes || *req.MaxBodyBytes > maxIntegrationMaxBodyBytes) {
 			return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", fmt.Sprintf("max_body_bytes must be between %d and %d", minIntegrationMaxBodyBytes, maxIntegrationMaxBodyBytes), nil))
 		}
 	}
@@ -353,7 +355,7 @@ func (h *Handler) UpdateIntegrationRoute(c fiber.Ctx) error {
 		if req.DeadlineMs != nil {
 			r.DeadlineMs = *req.DeadlineMs
 		}
-		if req.MaxBodyBytes != nil {
+		if req.MaxBodyBytes != nil && *req.MaxBodyBytes != 0 {
 			r.MaxBodyBytes = *req.MaxBodyBytes
 		}
 		if strings.TrimSpace(req.TokenAuthMode) != "" {

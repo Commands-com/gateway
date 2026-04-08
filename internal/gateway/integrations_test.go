@@ -517,6 +517,98 @@ func TestWebSocketUpgradeMiddlewareForAgentAndTunnel(t *testing.T) {
 	}
 }
 
+func TestCreateIntegrationRouteTreatsZeroMaxBodyBytesAsDefault(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+		"max_body_bytes":  0,
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	if got, _ := routeObj["max_body_bytes"].(float64); int(got) != defaultIntegrationMaxBodyBytes {
+		t.Fatalf("expected default max_body_bytes %d, got %v", defaultIntegrationMaxBodyBytes, routeObj["max_body_bytes"])
+	}
+}
+
+func TestUpdateIntegrationRouteIgnoresZeroMaxBodyBytes(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+		"max_body_bytes":  4096,
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	routeID, _ := routeObj["route_id"].(string)
+	if routeID == "" {
+		t.Fatalf("expected route_id in create response")
+	}
+
+	resp := mustDoJSON(t, app, "PUT", "/gateway/v1/integrations/routes/"+routeID, map[string]any{
+		"max_body_bytes": 0,
+		"status":         "inactive",
+	}, "owner1", "owner@example.com", fiber.StatusOK)
+
+	updatedRoute, ok := resp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in update response")
+	}
+	if got, _ := updatedRoute["max_body_bytes"].(float64); int(got) != 4096 {
+		t.Fatalf("expected max_body_bytes to remain 4096, got %v", updatedRoute["max_body_bytes"])
+	}
+}
+
+func TestCreateIntegrationRouteAcceptsSpecMaxBodyBytes(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+	})
+	app := newGatewayIntegrationTestApp(h)
+
+	ownerIdentityKey, _ := testEd25519Identity("owner1")
+	mustDoJSON(t, app, "PUT", "/gateway/v1/devices/devowner1/identity-key", identityPayload(ownerIdentityKey), "owner1", "owner@example.com", fiber.StatusNoContent)
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devowner1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+		"max_body_bytes":  10 * 1024 * 1024,
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	if got, _ := routeObj["max_body_bytes"].(float64); int(got) != 10*1024*1024 {
+		t.Fatalf("expected max_body_bytes to remain at spec max, got %v", routeObj["max_body_bytes"])
+	}
+}
+
 func newGatewayIntegrationTestApp(h *Handler) *fiber.App {
 	app := fiber.New()
 	app.Use(func(c fiber.Ctx) error {
