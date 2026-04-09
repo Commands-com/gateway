@@ -6,6 +6,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"oss-commands-gateway/internal/config"
 	"oss-commands-gateway/internal/httputil"
 )
 
@@ -16,9 +17,55 @@ func (h *Handler) Token(c fiber.Ctx) error {
 		return h.exchangeAuthorizationCode(c)
 	case "refresh_token":
 		return h.exchangeRefreshToken(c)
+	case "client_credentials":
+		return h.exchangeClientCredentials(c)
 	default:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unsupported grant_type"})
 	}
+}
+
+// exchangeClientCredentials issues an access token for a public client without
+// a user context. This is intended for headless agents (e.g. the Shep daemon
+// during local development) that need to register integration routes on their
+// own behalf.
+//
+// Restricted to AuthModeDemo. Under any other auth mode this grant is
+// unavailable and returns unsupported_grant_type, preserving production
+// security semantics.
+func (h *Handler) exchangeClientCredentials(c fiber.Ctx) error {
+	if h.cfg.AuthMode != config.AuthModeDemo {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unsupported_grant_type"})
+	}
+	// Demo mode: any public client_id is accepted. This mirrors the "demo is
+	// non-production" warning logged at startup and makes the grant usable
+	// from headless agents regardless of their hardcoded client id.
+	clientID := h.resolveClientID(c)
+	if clientID == "" {
+		clientID = h.cfg.OAuthDefaultClientID
+	}
+	scope := strings.TrimSpace(c.FormValue("scope"))
+	scopes := strings.Fields(scope)
+	// Subject is synthesised from the client id so every route created via
+	// this grant maps to a single "demo owner" in memory, which is what
+	// RequireUser downstream expects.
+	subject := "client:" + clientID
+	accessToken, expiresIn, err := h.jwt.IssueAccessToken(
+		subject,
+		"",
+		clientID,
+		scopes,
+		string(h.cfg.AuthMode),
+		h.cfg.AccessTokenTTL,
+	)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "server_error"})
+	}
+	return c.JSON(fiber.Map{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   expiresIn,
+		"scope":        scope,
+	})
 }
 
 // resolveClientID returns the client_id from the request, defaulting to the

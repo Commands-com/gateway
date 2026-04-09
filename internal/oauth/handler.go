@@ -62,13 +62,17 @@ func (h *Handler) Register(c fiber.Ctx) error {
 
 func (h *Handler) WellKnown(c fiber.Ctx) error {
 	issuer := strings.TrimRight(h.cfg.PublicBaseURL, "/")
+	grantTypes := []string{"authorization_code", "refresh_token"}
+	if h.cfg.AuthMode == config.AuthModeDemo {
+		grantTypes = append(grantTypes, "client_credentials")
+	}
 	return c.JSON(fiber.Map{
 		"issuer":                                issuer,
 		"authorization_endpoint":                issuer + "/oauth/authorize",
 		"token_endpoint":                        issuer + "/oauth/token",
 		"jwks_uri":                              issuer + "/.well-known/jwks.json",
 		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"grant_types_supported":                 grantTypes,
 		"token_endpoint_auth_methods_supported": []string{"none"},
 		"code_challenge_methods_supported":      []string{"S256"},
 		"scopes_supported":                      []string{"profile", "email"},
