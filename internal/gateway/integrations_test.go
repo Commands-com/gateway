@@ -517,6 +517,67 @@ func TestWebSocketUpgradeMiddlewareForAgentAndTunnel(t *testing.T) {
 	}
 }
 
+func TestCreateIntegrationRouteAutoRegistersDeviceInDemoMode(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+		AuthMode:      config.AuthModeDemo,
+	})
+	app := newGatewayIntegrationTestApp(h)
+
+	// No prior identity-key PUT: the device does not exist in the store.
+	createResp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devheadless1",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+	}, "owner1", "owner@example.com", fiber.StatusCreated)
+
+	routeObj, ok := createResp["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected route object in create response")
+	}
+	if routeID, _ := routeObj["route_id"].(string); routeID == "" {
+		t.Fatalf("expected route_id in create response, got %v", createResp)
+	}
+
+	// Device should have been auto-registered and bound to the caller.
+	device, found, err := h.store.GetDevice(context.Background(), "devheadless1")
+	if err != nil || !found {
+		t.Fatalf("expected auto-registered device, found=%v err=%v", found, err)
+	}
+	if device.OwnerUID != "owner1" {
+		t.Fatalf("expected device owner to be caller, got %q", device.OwnerUID)
+	}
+}
+
+func TestCreateIntegrationRouteRejectsUnknownDeviceOutsideDemoMode(t *testing.T) {
+	h := NewHandler(&config.Config{
+		FrontendURL:   "https://frontend.example",
+		StateBackend:  config.StateBackendMemory,
+		PublicBaseURL: "http://localhost:8080",
+		AuthMode:      config.AuthModeOIDC,
+	})
+	app := newGatewayIntegrationTestApp(h)
+
+	resp := mustDoJSON(t, app, "POST", "/gateway/v1/integrations/routes", map[string]any{
+		"device_id":       "devheadless2",
+		"interface_type":  "slack_events",
+		"token_auth_mode": "path",
+	}, "owner1", "owner@example.com", fiber.StatusBadRequest)
+
+	errObj, _ := resp["error"].(map[string]any)
+	if errObj == nil {
+		t.Fatalf("expected structured error response, got %v", resp)
+	}
+	if code, _ := errObj["code"].(string); code != "invalid_request" {
+		t.Fatalf("expected invalid_request code, got %v", errObj)
+	}
+	if _, found, _ := h.store.GetDevice(context.Background(), "devheadless2"); found {
+		t.Fatalf("device must NOT be auto-registered outside demo mode")
+	}
+}
+
 func newGatewayIntegrationTestApp(h *Handler) *fiber.App {
 	app := fiber.New()
 	app.Use(func(c fiber.Ctx) error {
