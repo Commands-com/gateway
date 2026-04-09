@@ -117,14 +117,14 @@ No credentials file needed — OIDC validates tokens via Firebase's public JWKS.
 | Mode | Use case | Required vars |
 |---|---|---|
 | `demo` | Local dev, testing | None beyond `JWT_SIGNING_KEY` |
+| `firebase` | Firebase Admin SDK verification | `FIREBASE_PROJECT_ID` |
+| `oidc` | Any OIDC provider (inc. Firebase) | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` |
 
 In `demo` mode, the token endpoint additionally accepts the `client_credentials`
 grant and `POST /gateway/v1/integrations/routes` auto-registers an unknown
 `device_id` on first use. Both affordances exist so headless agents can
 bootstrap without a browser redirect or prior identity-key PUT. They are
 unavailable in any other auth mode.
-| `firebase` | Firebase Admin SDK verification | `FIREBASE_PROJECT_ID` |
-| `oidc` | Any OIDC provider (inc. Firebase) | `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` |
 
 When `FIREBASE_API_KEY` and `FIREBASE_PROJECT_ID` are set, the authorize page shows
 Google and GitHub popup sign-in buttons. Works with both `firebase` and `oidc` modes.
