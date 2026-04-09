@@ -8,6 +8,13 @@ import (
 
 // Health returns a minimal status when unauthenticated, or detailed stats when
 // called by an authenticated user.
+//
+// The user-scoped counters (devices, grants, sessions, routes) are filtered
+// by the caller's UID so the dashboard tiles match the corresponding tab
+// listings. The node-local operational counters (agents, tunnels, inflight,
+// event_backlogs) remain whole-node metrics — they represent what this
+// gateway instance is currently handling and are not meaningful to scope by
+// user identity.
 func (h *Handler) Health(c fiber.Ctx) error {
 	principal := auth.PrincipalFromContext(c)
 	if principal == nil {
@@ -17,11 +24,35 @@ func (h *Handler) Health(c fiber.Ctx) error {
 		})
 	}
 
-	devices, _ := h.store.CountDevices(c.Context())
-	grants, _ := h.store.CountShareGrants(c.Context())
-	sessions, _ := h.store.CountSessions(c.Context())
-	routes, _ := h.store.CountIntegrationRoutes(c.Context())
-	eventBacklogs, _ := h.store.CountSessionEventBacklogs(c.Context())
+	ctx := c.Context()
+	uid := principal.UID
+
+	devices, _ := h.store.CountDevicesByOwner(ctx, uid)
+
+	ownedRoutes, _ := h.store.ListIntegrationRoutesByOwner(ctx, uid)
+	routes := len(ownedRoutes)
+
+	// No owner index exists for grants or sessions, so filter in memory.
+	// The in-memory state store's List* methods already clone each record,
+	// which is acceptable here — /health is not on any hot path.
+	grants := 0
+	if allGrants, err := h.store.ListShareGrants(ctx); err == nil {
+		for _, grant := range allGrants {
+			if grant != nil && grant.OwnerUID == uid {
+				grants++
+			}
+		}
+	}
+	sessions := 0
+	if allSessions, err := h.store.ListSessions(ctx); err == nil {
+		for _, sess := range allSessions {
+			if sess != nil && sess.OwnerUID == uid {
+				sessions++
+			}
+		}
+	}
+
+	eventBacklogs, _ := h.store.CountSessionEventBacklogs(ctx)
 
 	h.mu.RLock()
 	agents := len(h.agents)
