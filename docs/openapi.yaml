@@ -100,7 +100,15 @@ paths:
           description: Authorization code issued
   /oauth/token:
     post:
-      summary: Exchange auth code or refresh token
+      summary: Exchange auth code, refresh token, or (demo only) client credentials
+      description: |
+        Supported grant types:
+        - `authorization_code`
+        - `refresh_token`
+        - `client_credentials` — **only** when `AUTH_MODE=demo`. Intended for headless
+          agents (e.g. the Shep daemon in local development) that need to mint an
+          access token without a user context. Returns `unsupported_grant_type` in
+          any non-demo auth mode.
       security: []
       responses:
         '200':

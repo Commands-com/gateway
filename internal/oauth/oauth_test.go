@@ -309,11 +309,16 @@ func TestVerifyPKCE(t *testing.T) {
 
 func newDemoOAuthTestApp(t *testing.T) *fiber.App {
 	t.Helper()
+	return newOAuthTestAppWithMode(t, config.AuthModeDemo)
+}
+
+func newOAuthTestAppWithMode(t *testing.T, mode config.AuthMode) *fiber.App {
+	t.Helper()
 
 	cfg := &config.Config{
 		PublicBaseURL:        "http://localhost:8080",
 		RedirectAllowlist:    []string{"http://localhost:61696/callback", "urn:ietf:wg:oauth:2.0:oob"},
-		AuthMode:             config.AuthModeDemo,
+		AuthMode:             mode,
 		AuthCodeTTL:          5 * time.Minute,
 		AccessTokenTTL:       1 * time.Hour,
 		RefreshTokenTTL:      24 * time.Hour,
@@ -333,7 +338,84 @@ func newDemoOAuthTestApp(t *testing.T) *fiber.App {
 	app.Post("/oauth/authorize", h.Authorize)
 	app.Post("/oauth/token", h.Token)
 	app.Post("/oauth/token/revoke", h.RevokeToken)
+	app.Get("/.well-known/oauth-authorization-server", h.WellKnown)
 	return app
+}
+
+func TestClientCredentialsGrantInDemoMode(t *testing.T) {
+	app := newDemoOAuthTestApp(t)
+
+	values := url.Values{}
+	values.Set("grant_type", "client_credentials")
+	values.Set("client_id", "commands-agent")
+	values.Set("scope", "profile")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/token", values, fiber.StatusOK)
+
+	accessToken, _ := resp["access_token"].(string)
+	if accessToken == "" {
+		t.Fatalf("expected access_token in client_credentials response, got %v", resp)
+	}
+	if tt, _ := resp["token_type"].(string); tt != "Bearer" {
+		t.Fatalf("expected token_type=Bearer, got %v", resp["token_type"])
+	}
+	// client_credentials must NOT issue a refresh token.
+	if _, hasRefresh := resp["refresh_token"]; hasRefresh {
+		t.Fatalf("client_credentials response must not include a refresh_token, got %v", resp)
+	}
+
+	// Issued token should parse, be bound to the client, and carry a
+	// "client:" subject so downstream RequireUser can map it to a
+	// stable demo owner.
+	jm, err := jwt.NewManager("test-signing-secret-at-least-32-bytes-long", "http://localhost:8080", "commands-gateway-test")
+	if err != nil {
+		t.Fatalf("jwt init: %v", err)
+	}
+	claims, err := jm.ParseAccessToken(accessToken)
+	if err != nil {
+		t.Fatalf("parse access token: %v", err)
+	}
+	if !strings.HasPrefix(claims.Subject, "client:") {
+		t.Fatalf("expected subject to start with 'client:', got %q", claims.Subject)
+	}
+}
+
+func TestClientCredentialsGrantRejectedOutsideDemoMode(t *testing.T) {
+	app := newOAuthTestAppWithMode(t, config.AuthModeOIDC)
+
+	values := url.Values{}
+	values.Set("grant_type", "client_credentials")
+	values.Set("client_id", "commands-agent")
+
+	resp := mustDoForm(t, app, "POST", "/oauth/token", values, fiber.StatusBadRequest)
+	if got, _ := resp["error"].(string); got != "unsupported_grant_type" {
+		t.Fatalf("expected unsupported_grant_type outside demo, got %v", resp)
+	}
+}
+
+func TestWellKnownAdvertisesClientCredentialsInDemoOnly(t *testing.T) {
+	demoApp := newDemoOAuthTestApp(t)
+	demoResp := mustDoForm(t, demoApp, "GET", "/.well-known/oauth-authorization-server", nil, fiber.StatusOK)
+	grants, _ := demoResp["grant_types_supported"].([]any)
+	if !containsString(grants, "client_credentials") {
+		t.Fatalf("expected demo-mode /.well-known to advertise client_credentials, got %v", grants)
+	}
+
+	oidcApp := newOAuthTestAppWithMode(t, config.AuthModeOIDC)
+	oidcResp := mustDoForm(t, oidcApp, "GET", "/.well-known/oauth-authorization-server", nil, fiber.StatusOK)
+	grants, _ = oidcResp["grant_types_supported"].([]any)
+	if containsString(grants, "client_credentials") {
+		t.Fatalf("expected non-demo /.well-known NOT to advertise client_credentials, got %v", grants)
+	}
+}
+
+func containsString(items []any, want string) bool {
+	for _, v := range items {
+		if s, ok := v.(string); ok && s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func mustDoForm(t *testing.T, app *fiber.App, method, path string, values url.Values, expectedStatus int) map[string]any {

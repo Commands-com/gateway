@@ -13,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"oss-commands-gateway/internal/auth"
+	"oss-commands-gateway/internal/config"
 )
 
 var routeIDPattern = regexp.MustCompile(`^rt_[a-f0-9]{32}$`)
@@ -146,6 +147,26 @@ func (h *Handler) CreateIntegrationRoute(c fiber.Ctx) error {
 	device, found, err := h.store.GetDevice(c.Context(), deviceID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to load device", nil))
+	}
+	if !found {
+		// Demo mode: auto-register a minimal device record on first use so
+		// headless agents (e.g. Shep daemon during local development) can
+		// bootstrap without first performing the full identity-key PUT.
+		// Production modes still require explicit device registration.
+		if h.cfg != nil && h.cfg.AuthMode == config.AuthModeDemo {
+			now := time.Now().UTC().Unix()
+			device = deviceRecord{
+				DeviceID:    deviceID,
+				OwnerUID:    principal.UID,
+				OwnerEmail:  canonicalEmail(principal.Email),
+				DisplayName: deviceID,
+				UpdatedAt:   now,
+			}
+			if err := h.store.SaveDevice(c.Context(), device); err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(integrationErrorResponse("internal_error", "Failed to auto-register device", nil))
+			}
+			found = true
+		}
 	}
 	if !found {
 		return c.Status(fiber.StatusBadRequest).JSON(integrationErrorResponse("invalid_request", "Device not found; register the device before creating a route", nil))
