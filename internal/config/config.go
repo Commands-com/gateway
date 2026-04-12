@@ -66,6 +66,23 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	// Auto-load a local .env file if present, in the spirit of node.js
+	// dotenv. The path is overridable via DOTENV_PATH so tests and
+	// non-default deployments can opt out or point elsewhere; an empty
+	// value disables loading entirely. Existing process env vars take
+	// precedence (see LoadDotEnv).
+	dotenvPath := strings.TrimSpace(os.Getenv("DOTENV_PATH"))
+	if dotenvPath == "" {
+		// Sentinel: an unset DOTENV_PATH means "use the default .env in
+		// the current working directory". Set DOTENV_PATH=- to disable.
+		dotenvPath = ".env"
+	}
+	if dotenvPath != "-" {
+		if err := LoadDotEnv(dotenvPath); err != nil {
+			return nil, fmt.Errorf("dotenv: %w", err)
+		}
+	}
+
 	defaultRedirects := []string{
 		"http://localhost:61696/callback",
 		"http://localhost:3000/callback",
